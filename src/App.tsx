@@ -1,11 +1,45 @@
 import { useState, useEffect, useCallback } from "react";
+import type { CSSProperties } from "react";
 
 const SUPABASE_URL  = "https://qsypjducygmabychfwnt.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFzeXBqZHVjeWdtYWJ5Y2hmd250Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIyOTcwOTcsImV4cCI6MjA4Nzg3MzA5N30.jjHpFO-LkWYtc98to6MaYn1q8GTM6wb6WNp_cRK-jVE";
 const OWNER_EMAIL   = "your@email.com";
 
+// ── Types ──────────────────────────────────────────────────────────────────
+interface Session {
+  access_token: string;
+  [key: string]: unknown;
+}
+
+interface License {
+  id: string;
+  license_key: string;
+  label: string;
+  domain: string | null;
+  expires_at: string | null;
+  notes: string | null;
+  is_active: boolean;
+  revoked_at: string | null;
+  machine_id: string | null;
+  machine_hash: string | null;
+  created_at: string;
+}
+
+interface ConfirmState {
+  msg: string;
+  onYes: () => void;
+}
+
+interface ToastState {
+  msg: string;
+  type: "ok" | "err";
+}
+
+type PillColor = "green" | "red" | "blue" | "gold" | "muted";
+
+// ── Supabase helpers ───────────────────────────────────────────────────────
 const sb = {
-  async signIn(email, password) {
+  async signIn(email: string, password: string) {
     const r = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
       method: "POST",
       headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON },
@@ -13,13 +47,13 @@ const sb = {
     });
     return r.json();
   },
-  async query(table, params = "", token) {
+  async query(table: string, params: string = "", token: string) {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}${params}`, {
       headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json", Prefer: "return=representation" },
     });
     return r.json();
   },
-  async insert(table, data, token) {
+  async insert(table: string, data: Record<string, unknown>, token: string) {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
       method: "POST",
       headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json", Prefer: "return=representation" },
@@ -27,7 +61,7 @@ const sb = {
     });
     return r.json();
   },
-  async patch(table, id, data, token) {
+  async patch(table: string, id: string, data: Record<string, unknown>, token: string) {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${id}`, {
       method: "PATCH",
       headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json", Prefer: "return=representation" },
@@ -35,7 +69,7 @@ const sb = {
     });
     return r.json();
   },
-  async delete(table, id, token) {
+  async delete(table: string, id: string, token: string) {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${id}`, {
       method: "DELETE",
       headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -44,14 +78,15 @@ const sb = {
   },
 };
 
-function generateKey() {
+function generateKey(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const seg = (n) => Array.from({ length: n }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+  const seg = (n: number) => Array.from({ length: n }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
   return `MSM-${seg(4)}-${seg(4)}-${seg(4)}-${seg(4)}`;
 }
 
-const Pill = ({ children, color }) => {
-  const colors = {
+// ── Sub-components ─────────────────────────────────────────────────────────
+const Pill = ({ children, color }: { children: React.ReactNode; color: PillColor }) => {
+  const colors: Record<PillColor, CSSProperties> = {
     green: { background:"rgba(34,197,94,.15)",  color:"#4ade80", border:"1px solid rgba(34,197,94,.3)" },
     red:   { background:"rgba(239,68,68,.15)",   color:"#f87171", border:"1px solid rgba(239,68,68,.3)" },
     blue:  { background:"rgba(14,165,233,.15)",  color:"#38bdf8", border:"1px solid rgba(14,165,233,.3)" },
@@ -61,11 +96,11 @@ const Pill = ({ children, color }) => {
   return (
     <span style={{ display:"inline-block", padding:"2px 10px", borderRadius:"2px",
       fontFamily:"'DM Mono',monospace", fontSize:"10px", letterSpacing:"1px",
-      textTransform:"uppercase", ...(colors[color]||colors.muted) }}>{children}</span>
+      textTransform:"uppercase", ...(colors[color] ?? colors.muted) }}>{children}</span>
   );
 };
 
-const Toast = ({ msg, type, onClose }) => (
+const Toast = ({ msg, type, onClose }: { msg: string; type: "ok" | "err"; onClose: () => void }) => (
   <div style={{ position:"fixed", bottom:24, right:24, zIndex:999,
     background: type==="ok" ? "rgba(34,197,94,.15)" : "rgba(239,68,68,.15)",
     border:`1px solid ${type==="ok" ? "rgba(34,197,94,.3)" : "rgba(239,68,68,.3)"}`,
@@ -78,8 +113,7 @@ const Toast = ({ msg, type, onClose }) => (
   </div>
 );
 
-// Confirm dialog
-const Confirm = ({ msg, onYes, onNo }) => (
+const Confirm = ({ msg, onYes, onNo }: { msg: string; onYes: () => void; onNo: () => void }) => (
   <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.75)", backdropFilter:"blur(4px)",
     display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
     <div style={{ background:"#0d1117", border:"1px solid rgba(255,255,255,.1)", borderRadius:4,
@@ -99,14 +133,15 @@ const Confirm = ({ msg, onYes, onNo }) => (
   </div>
 );
 
+// ── Main Component ─────────────────────────────────────────────────────────
 export default function LicenseManager() {
-  const [session, setSession]     = useState(null);
+  const [session, setSession]     = useState<Session | null>(null);
   const [email, setEmail]         = useState("");
   const [password, setPassword]   = useState("");
   const [authErr, setAuthErr]     = useState("");
   const [loading, setLoading]     = useState(false);
 
-  const [licenses, setLicenses]   = useState([]);
+  const [licenses, setLicenses]   = useState<License[]>([]);
   const [fetching, setFetching]   = useState(false);
 
   const [showNew, setShowNew]     = useState(false);
@@ -117,23 +152,28 @@ export default function LicenseManager() {
   const [newNotes, setNewNotes]   = useState("");
   const [creating, setCreating]   = useState(false);
 
-  const [toast, setToast]         = useState(null);
+  const [toast, setToast]         = useState<ToastState | null>(null);
   const [search, setSearch]       = useState("");
   const [filter, setFilter]       = useState("all");
-  const [copied, setCopied]       = useState(null);
-  const [confirm, setConfirm]     = useState(null); // { msg, onYes }
+  const [copied, setCopied]       = useState<string | null>(null);
+  const [confirm, setConfirm]     = useState<ConfirmState | null>(null);
 
-  const showToast = (msg, type="ok") => { setToast({msg,type}); setTimeout(()=>setToast(null),4000); };
-  const askConfirm = (msg, onYes) => setConfirm({ msg, onYes });
+  const showToast = (msg: string, type: "ok" | "err" = "ok") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 4000);
+  };
+  const askConfirm = (msg: string, onYes: () => void) => setConfirm({ msg, onYes });
 
-  const loadLicenses = useCallback(async (tok) => {
+  const loadLicenses = useCallback(async (tok: string) => {
     setFetching(true);
     try {
-      const data = await sb.query("licenses", "?select=*&order=created_at.desc", tok || session?.access_token);
+      const data = await sb.query("licenses", "?select=*&order=created_at.desc", tok);
       setLicenses(Array.isArray(data) ? data : []);
-    } catch(e) { showToast("Failed to load licenses", "err"); }
+    } catch {
+      showToast("Failed to load licenses", "err");
+    }
     setFetching(false);
-  }, [session]);
+  }, []);
 
   useEffect(() => { if (session) loadLicenses(session.access_token); }, [session, loadLicenses]);
 
@@ -147,10 +187,10 @@ export default function LicenseManager() {
     document.head.appendChild(style);
   }, []);
 
-  const handleSignIn = async (e) => {
+  const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setAuthErr("");
     const res = await sb.signIn(email, password);
-    if (res.access_token) setSession(res);
+    if (res.access_token) setSession(res as Session);
     else setAuthErr(res.error_description || res.msg || "Login failed");
     setLoading(false);
   };
@@ -158,6 +198,7 @@ export default function LicenseManager() {
   const handleCreate = async () => {
     if (!newLabel.trim()) { showToast("Label is required", "err"); return; }
     if (!newDomain.trim()) { showToast("Domain is required", "err"); return; }
+    if (!session) return;
     setCreating(true);
     const res = await sb.insert("licenses", {
       license_key: newKey,
@@ -178,12 +219,13 @@ export default function LicenseManager() {
     setCreating(false);
   };
 
-  const toggleActive = async (lic) => {
+  const toggleActive = async (lic: License) => {
     const action = lic.revoked_at ? "restore" : "revoke";
     askConfirm(
-      `${action.charAt(0).toUpperCase()+action.slice(1)} license "${lic.label}"?`,
+      `${action.charAt(0).toUpperCase() + action.slice(1)} license "${lic.label}"?`,
       async () => {
         setConfirm(null);
+        if (!session) return;
         const patch = lic.revoked_at
           ? { is_active: true,  revoked_at: null }
           : { is_active: false, revoked_at: new Date().toISOString() };
@@ -194,11 +236,12 @@ export default function LicenseManager() {
     );
   };
 
-  const handleDelete = async (lic) => {
+  const handleDelete = async (lic: License) => {
     askConfirm(
       `Permanently delete license "${lic.label}"?\n\nThis cannot be undone. The key will stop working immediately.`,
       async () => {
         setConfirm(null);
+        if (!session) return;
         const ok = await sb.delete("licenses", lic.id, session.access_token);
         if (ok) { showToast("License deleted."); loadLicenses(session.access_token); }
         else showToast("Delete failed", "err");
@@ -206,11 +249,12 @@ export default function LicenseManager() {
     );
   };
 
-  const handleUnlockMachine = async (lic) => {
+  const handleUnlockMachine = async (lic: License) => {
     askConfirm(
       `Remove machine lock from "${lic.label}"?\n\nThe next activation on any machine will re-bind it.`,
       async () => {
         setConfirm(null);
+        if (!session) return;
         const res = await sb.patch("licenses", lic.id, { machine_id: null, machine_hash: null }, session.access_token);
         if (Array.isArray(res)) { showToast("Machine lock removed."); loadLicenses(session.access_token); }
         else showToast("Failed to remove machine lock", "err");
@@ -218,7 +262,7 @@ export default function LicenseManager() {
     );
   };
 
-  const copyKey = (key) => {
+  const copyKey = (key: string) => {
     navigator.clipboard.writeText(key);
     setCopied(key);
     setTimeout(() => setCopied(null), 2000);
@@ -228,7 +272,7 @@ export default function LicenseManager() {
     const matchSearch = !search ||
       l.license_key.toLowerCase().includes(search.toLowerCase()) ||
       l.label.toLowerCase().includes(search.toLowerCase()) ||
-      (l.domain||"").toLowerCase().includes(search.toLowerCase());
+      (l.domain ?? "").toLowerCase().includes(search.toLowerCase());
     const matchFilter =
       filter === "all"     ? true :
       filter === "active"  ? l.is_active && !l.revoked_at :
@@ -237,18 +281,18 @@ export default function LicenseManager() {
   });
 
   const S = {
-    page:      { minHeight:"100vh", background:"#080c10", fontFamily:"'Syne',sans-serif", color:"#e2e8f0" },
+    page:      { minHeight:"100vh", background:"#080c10", fontFamily:"'Syne',sans-serif", color:"#e2e8f0" } as CSSProperties,
     loginWrap: { minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center",
-                 background:"linear-gradient(135deg,#080c10 0%,#0d1117 100%)" },
+                 background:"linear-gradient(135deg,#080c10 0%,#0d1117 100%)" } as CSSProperties,
     loginCard: { background:"#0d1117", border:"1px solid rgba(255,255,255,.07)", borderRadius:"3px",
-                 padding:"44px 40px", width:"100%", maxWidth:"400px", boxShadow:"0 40px 80px rgba(0,0,0,.7)" },
+                 padding:"44px 40px", width:"100%", maxWidth:"400px", boxShadow:"0 40px 80px rgba(0,0,0,.7)" } as CSSProperties,
     label:     { display:"block", fontFamily:"'DM Mono',monospace", fontSize:"10px", letterSpacing:"2px",
-                 textTransform:"uppercase", color:"#475569", marginBottom:"8px" },
+                 textTransform:"uppercase" as const, color:"#475569", marginBottom:"8px" } as CSSProperties,
     input:     { width:"100%", background:"rgba(255,255,255,.05)", border:"1px solid rgba(255,255,255,.1)",
                  borderRadius:"3px", padding:"12px 14px", color:"#fff", fontSize:"14px",
-                 fontFamily:"'DM Mono',monospace", outline:"none", marginBottom:"14px" },
-    btn: (c="blue") => ({
-      width:"100%", padding:"13px", borderRadius:"3px", border:"none", cursor:"pointer",
+                 fontFamily:"'DM Mono',monospace", outline:"none", marginBottom:"14px" } as CSSProperties,
+    btn: (c = "blue"): CSSProperties => ({
+      width:"100%", padding:"13px", borderRadius:"3px", cursor:"pointer",
       fontFamily:"'Syne',sans-serif", fontSize:"13px", fontWeight:"700", letterSpacing:"1.5px", textTransform:"uppercase",
       background: c==="blue"  ? "linear-gradient(135deg,#0ea5e9,#6366f1)" :
                   c==="green" ? "linear-gradient(135deg,#22c55e,#10b981)" :
@@ -259,19 +303,14 @@ export default function LicenseManager() {
     header: { background:"rgba(13,17,23,.9)", backdropFilter:"blur(12px)",
               borderBottom:"1px solid rgba(255,255,255,.06)", padding:"0 32px",
               display:"flex", alignItems:"center", justifyContent:"space-between",
-              height:"60px", position:"sticky", top:0, zIndex:10 },
-    main: { maxWidth:"1100px", margin:"0 auto", padding:"32px 24px" },
+              height:"60px", position:"sticky" as const, top:0, zIndex:10 } as CSSProperties,
+    main: { maxWidth:"1100px", margin:"0 auto", padding:"32px 24px" } as CSSProperties,
     card: { background:"#0d1117", border:"1px solid rgba(255,255,255,.07)",
-            borderRadius:"3px", overflow:"hidden", boxShadow:"0 4px 24px rgba(0,0,0,.3)" },
+            borderRadius:"3px", overflow:"hidden", boxShadow:"0 4px 24px rgba(0,0,0,.3)" } as CSSProperties,
     th:   { fontFamily:"'DM Mono',monospace", fontSize:"10px", letterSpacing:"2px",
-            textTransform:"uppercase", color:"#475569", padding:"12px 20px",
-            borderBottom:"1px solid rgba(255,255,255,.06)" },
-    mono: { fontFamily:"'DM Mono',monospace", fontSize:"12px", color:"#38bdf8", letterSpacing:"1px" },
-    iconBtn: (c="muted") => ({
-      padding:"5px 9px", borderRadius:"2px", cursor:"pointer", border:"none", background:"none",
-      fontFamily:"'DM Mono',monospace", fontSize:"11px", transition:"all .15s",
-      color: c==="red" ? "#f87171" : c==="green" ? "#4ade80" : c==="gold" ? "#fbbf24" : "#475569",
-    }),
+            textTransform:"uppercase" as const, color:"#475569", padding:"12px 20px",
+            borderBottom:"1px solid rgba(255,255,255,.06)" } as CSSProperties,
+    mono: { fontFamily:"'DM Mono',monospace", fontSize:"12px", color:"#38bdf8", letterSpacing:"1px" } as CSSProperties,
   };
 
   // ── Login ──────────────────────────────────────────────────────────────────
@@ -295,9 +334,9 @@ export default function LicenseManager() {
         )}
         <form onSubmit={handleSignIn}>
           <label style={S.label}>Email</label>
-          <input style={S.input} type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder={OWNER_EMAIL} required />
+          <input style={S.input} type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder={OWNER_EMAIL} required />
           <label style={S.label}>Password</label>
-          <input style={S.input} type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="••••••••" required />
+          <input style={S.input} type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" required />
           <button style={S.btn("blue")} type="submit" disabled={loading}>{loading ? "Authenticating..." : "🔐  Sign In"}</button>
         </form>
       </div>
@@ -348,10 +387,10 @@ export default function LicenseManager() {
           <input
             style={{ ...S.input, flex:1, minWidth:"200px", marginBottom:0, fontSize:"12px", padding:"10px 14px" }}
             placeholder="Search by key, label or domain..."
-            value={search} onChange={e=>setSearch(e.target.value)}
+            value={search} onChange={e => setSearch(e.target.value)}
           />
           {["all","active","revoked"].map(f => (
-            <button key={f} onClick={()=>setFilter(f)} style={{
+            <button key={f} onClick={() => setFilter(f)} style={{
               padding:"10px 16px", borderRadius:"3px", cursor:"pointer",
               fontFamily:"'DM Mono',monospace", fontSize:"11px", letterSpacing:"1px", textTransform:"uppercase",
               background: filter===f ? "rgba(14,165,233,.2)" : "rgba(255,255,255,.04)",
@@ -359,7 +398,7 @@ export default function LicenseManager() {
               color:      filter===f ? "#38bdf8" : "#475569",
             }}>{f}</button>
           ))}
-          <button onClick={()=>loadLicenses(session.access_token)} style={{ padding:"10px 14px", borderRadius:"3px", cursor:"pointer", fontSize:"14px", background:"rgba(255,255,255,.04)", border:"1px solid rgba(255,255,255,.08)", color:"#94a3b8" }}>↻</button>
+          <button onClick={() => loadLicenses(session.access_token)} style={{ padding:"10px 14px", borderRadius:"3px", cursor:"pointer", fontSize:"14px", background:"rgba(255,255,255,.04)", border:"1px solid rgba(255,255,255,.08)", color:"#94a3b8" }}>↻</button>
         </div>
 
         {/* Table */}
@@ -387,14 +426,14 @@ export default function LicenseManager() {
                 padding:"14px 20px", borderBottom:"1px solid rgba(255,255,255,.05)",
                 transition:"background .15s",
               }}
-              onMouseEnter={e=>e.currentTarget.style.background="rgba(255,255,255,.02)"}
-              onMouseLeave={e=>e.currentTarget.style.background=""}
+              onMouseEnter={e => (e.currentTarget as HTMLDivElement).style.background = "rgba(255,255,255,.02)"}
+              onMouseLeave={e => (e.currentTarget as HTMLDivElement).style.background = ""}
               >
                 {/* Key + Label */}
                 <div>
                   <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4 }}>
                     <code style={{ ...S.mono, fontSize:"13px" }}>{lic.license_key}</code>
-                    <button onClick={()=>copyKey(lic.license_key)} style={{
+                    <button onClick={() => copyKey(lic.license_key)} style={{
                       background:"none", border:"none", cursor:"pointer",
                       color: copied===lic.license_key ? "#4ade80" : "#334155",
                       fontSize:"12px", padding:"2px 4px", transition:"color .2s",
@@ -402,7 +441,7 @@ export default function LicenseManager() {
                   </div>
                   <div style={{ fontSize:"12px", color:"#94a3b8" }}>{lic.label}</div>
                   <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:3, flexWrap:"wrap" }}>
-                    {isMachineLocked && (
+                    {isMachineLocked && isLocalhost && (
                       <span style={{ display:"inline-flex", alignItems:"center", gap:4,
                         fontFamily:"'DM Mono',monospace", fontSize:"9px", color:"#475569", letterSpacing:.5 }}>
                         🔒 machine-locked
@@ -424,7 +463,7 @@ export default function LicenseManager() {
 
                 {/* Domain */}
                 <div style={{ fontFamily:"'DM Mono',monospace", fontSize:"11px", color:"#64748b" }}>
-                  {lic.domain || <span style={{color:"#334155"}}>—</span>}
+                  {lic.domain ?? <span style={{color:"#334155"}}>—</span>}
                 </div>
 
                 {/* Expires */}
@@ -449,8 +488,7 @@ export default function LicenseManager() {
 
                 {/* Actions */}
                 <div style={{ display:"flex", alignItems:"center", gap:4 }}>
-                  {/* Revoke / Restore */}
-                  <button onClick={()=>toggleActive(lic)} title={lic.revoked_at ? "Restore" : "Revoke"} style={{
+                  <button onClick={() => toggleActive(lic)} title={lic.revoked_at ? "Restore" : "Revoke"} style={{
                     padding:"5px 10px", borderRadius:"2px", cursor:"pointer",
                     fontFamily:"'DM Mono',monospace", fontSize:"10px", letterSpacing:"1px", textTransform:"uppercase",
                     background: lic.revoked_at ? "rgba(34,197,94,.1)" : "rgba(239,68,68,.1)",
@@ -460,14 +498,14 @@ export default function LicenseManager() {
                     {lic.revoked_at ? "Restore" : "Revoke"}
                   </button>
 
-                  {/* Delete */}
-                  <button onClick={()=>handleDelete(lic)} title="Delete permanently" style={{
-                    padding:"5px 8px", borderRadius:"2px", cursor:"pointer",
-                    background:"rgba(239,68,68,.08)", border:"1px solid rgba(239,68,68,.15)",
-                    color:"#7f1d1d", fontSize:"13px", lineHeight:1, transition:"all .15s",
-                  }}
-                  onMouseEnter={e=>{ e.target.style.background="rgba(239,68,68,.2)"; e.target.style.color="#f87171"; }}
-                  onMouseLeave={e=>{ e.target.style.background="rgba(239,68,68,.08)"; e.target.style.color="#7f1d1d"; }}
+                  <button
+                    onClick={() => handleDelete(lic)}
+                    title="Delete permanently"
+                    style={{ padding:"5px 8px", borderRadius:"2px", cursor:"pointer",
+                      background:"rgba(239,68,68,.08)", border:"1px solid rgba(239,68,68,.15)",
+                      color:"#7f1d1d", fontSize:"13px", lineHeight:1, transition:"all .15s" }}
+                    onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(239,68,68,.2)"; (e.currentTarget as HTMLButtonElement).style.color = "#f87171"; }}
+                    onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(239,68,68,.08)"; (e.currentTarget as HTMLButtonElement).style.color = "#7f1d1d"; }}
                   >🗑</button>
                 </div>
               </div>
@@ -479,7 +517,7 @@ export default function LicenseManager() {
         {showNew && (
           <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.8)", backdropFilter:"blur(4px)",
             display:"flex", alignItems:"center", justifyContent:"center", zIndex:100, padding:20 }}
-            onClick={e=>{ if(e.target===e.currentTarget) setShowNew(false); }}>
+            onClick={e => { if (e.target === e.currentTarget) setShowNew(false); }}>
             <div style={{ ...S.card, width:"100%", maxWidth:"480px", padding:"36px" }}>
               <div style={{ fontSize:"18px", fontWeight:"800", color:"#fff", marginBottom:"4px" }}>
                 Generate <span style={{color:"#0ea5e9"}}>License Key</span>
@@ -491,24 +529,24 @@ export default function LicenseManager() {
                 <code style={{ flex:1, background:"rgba(255,255,255,.04)", border:"1px solid rgba(255,255,255,.1)",
                   borderRadius:"3px", padding:"12px 14px", fontFamily:"'DM Mono',monospace",
                   fontSize:"13px", color:"#38bdf8", letterSpacing:"1.5px" }}>{newKey}</code>
-                <button onClick={()=>setNewKey(generateKey())} style={{ padding:"12px 14px", background:"rgba(255,255,255,.05)", border:"1px solid rgba(255,255,255,.1)", borderRadius:"3px", color:"#94a3b8", cursor:"pointer", fontSize:"16px" }}>↻</button>
-                <button onClick={()=>copyKey(newKey)} style={{ padding:"12px 14px", background:"rgba(14,165,233,.1)", border:"1px solid rgba(14,165,233,.25)", borderRadius:"3px", color:"#38bdf8", cursor:"pointer", fontSize:"14px" }}>{copied===newKey ? "✓" : "⧉"}</button>
+                <button onClick={() => setNewKey(generateKey())} style={{ padding:"12px 14px", background:"rgba(255,255,255,.05)", border:"1px solid rgba(255,255,255,.1)", borderRadius:"3px", color:"#94a3b8", cursor:"pointer", fontSize:"16px" }}>↻</button>
+                <button onClick={() => copyKey(newKey)} style={{ padding:"12px 14px", background:"rgba(14,165,233,.1)", border:"1px solid rgba(14,165,233,.25)", borderRadius:"3px", color:"#38bdf8", cursor:"pointer", fontSize:"14px" }}>{copied===newKey ? "✓" : "⧉"}</button>
               </div>
 
               <label style={S.label}>Label *</label>
-              <input style={S.input} value={newLabel} onChange={e=>setNewLabel(e.target.value)} placeholder="e.g. Mark Local Desktop" />
+              <input style={S.input} value={newLabel} onChange={e => setNewLabel(e.target.value)} placeholder="e.g. Mark Local Desktop" />
 
               <label style={S.label}>Domain * <span style={{color:"#334155",fontWeight:400}}>(bare domain, no https)</span></label>
-              <input style={S.input} value={newDomain} onChange={e=>setNewDomain(e.target.value)} placeholder="e.g. localhost or overtime.valenzuela.gov.ph" />
+              <input style={S.input} value={newDomain} onChange={e => setNewDomain(e.target.value)} placeholder="e.g. localhost or overtime.valenzuela.gov.ph" />
 
               <label style={S.label}>Expiry Date (optional)</label>
-              <input style={S.input} type="date" value={newExpiry} onChange={e=>setNewExpiry(e.target.value)} />
+              <input style={S.input} type="date" value={newExpiry} onChange={e => setNewExpiry(e.target.value)} />
 
               <label style={S.label}>Notes (optional)</label>
-              <input style={S.input} value={newNotes} onChange={e=>setNewNotes(e.target.value)} placeholder="Internal notes..." />
+              <input style={S.input} value={newNotes} onChange={e => setNewNotes(e.target.value)} placeholder="Internal notes..." />
 
               <div style={{ display:"flex", gap:12, marginTop:4 }}>
-                <button onClick={()=>setShowNew(false)} style={{ ...S.btn("muted"), flex:"0 0 auto", width:"auto", padding:"12px 20px" }}>Cancel</button>
+                <button onClick={() => setShowNew(false)} style={{ ...S.btn("muted"), flex:"0 0 auto", width:"auto", padding:"12px 20px" }}>Cancel</button>
                 <button onClick={handleCreate} disabled={creating} style={{ ...S.btn("green"), flex:1 }}>{creating ? "Creating..." : "✓  Create License"}</button>
               </div>
             </div>
@@ -516,8 +554,8 @@ export default function LicenseManager() {
         )}
       </div>
 
-      {confirm && <Confirm msg={confirm.msg} onYes={confirm.onYes} onNo={()=>setConfirm(null)} />}
-      {toast && <Toast msg={toast.msg} type={toast.type} onClose={()=>setToast(null)} />}
+      {confirm && <Confirm msg={confirm.msg} onYes={confirm.onYes} onNo={() => setConfirm(null)} />}
+      {toast && <Toast msg={toast.msg} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   );
 }
