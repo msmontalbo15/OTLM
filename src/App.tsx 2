@@ -1,0 +1,1664 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import type { ReactNode } from "react";
+
+// ─── TYPES ────────────────────────────────────────────────────────────────────
+interface SupabaseUser {
+  id: string;
+  email: string;
+}
+
+interface License {
+  id: string;
+  key: string;
+  product_id: string | null;
+  owner_id: string;
+  status: "active" | "expired" | "suspended" | "trial";
+  allowed_domains: string[] | null;
+  allowed_ips: string[] | null;
+  expires_at: string | null;
+  max_activations: number;
+  activations: number;
+  customer_email: string | null;
+  customer_name: string | null;
+  notes: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+interface Product {
+  id: string;
+  name: string;
+  description: string | null;
+  owner_id: string;
+  created_at: string;
+}
+
+interface ValidationLog {
+  id: string;
+  license_id: string | null;
+  license_key: string;
+  domain: string | null;
+  ip_address: string | null;
+  framework: string | null;
+  result: "valid" | "invalid" | "expired" | "suspended" | "domain_mismatch" | "quota_exceeded";
+  created_at: string;
+}
+
+interface ValidationResult {
+  valid: boolean;
+  result: string;
+  reason: string | null;
+  license: License | null;
+}
+
+interface Framework {
+  id: string;
+  name: string;
+  lang: string;
+  icon: string;
+  pkg: string;
+  color: string;
+}
+
+interface SimLogLine {
+  t: number;
+  cls: string;
+  text: string;
+}
+
+interface DayCount {
+  v: number;
+  i: number;
+}
+
+// ─── SUPABASE CONFIG ──────────────────────────────────────────────────────────
+const SB_URL = "https://gdmknaditlpfjcplsygc.supabase.co";
+const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdkbWtuYWRpdGxwZmpjcGxzeWdjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1MDcwNTAsImV4cCI6MjA4ODA4MzA1MH0.WhfEeBpQDqaaMlvUL4ibsluLhYKJtKc0dg-bZkt0ufw";
+const STORAGE_KEY = "lh_session";
+
+// ─── SUPABASE CLIENT ──────────────────────────────────────────────────────────
+const sb = {
+  _token: null as string | null,
+  _user:  null as SupabaseUser | null,
+  _refreshToken: null as string | null,
+
+  _h(extra: Record<string, string> = {}): Record<string, string> {
+    return {
+      "Content-Type": "application/json",
+      apikey: SB_KEY,
+      Authorization: `Bearer ${this._token ?? SB_KEY}`,
+      Prefer: "return=representation",
+      ...extra,
+    };
+  },
+
+  _save(): void {
+    if (!this._token) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        token: this._token,
+        refresh: this._refreshToken,
+        user: this._user,
+        exp: Date.now() + 3_600_000,
+      }));
+    } catch (_) { /* ignore */ }
+  },
+
+  _clear(): void {
+    this._token = null; this._user = null; this._refreshToken = null;
+    try { localStorage.removeItem(STORAGE_KEY); } catch (_) { /* ignore */ }
+  },
+
+  restore(): boolean {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return false;
+      const s = JSON.parse(raw) as { token: string; refresh: string; user: SupabaseUser; exp: number };
+      if (Date.now() > s.exp) { this._clear(); return false; }
+      this._token = s.token;
+      this._user  = s.user;
+      this._refreshToken = s.refresh;
+      return true;
+    } catch (_) { return false; }
+  },
+
+  async refresh(): Promise<boolean> {
+    if (!this._refreshToken) return false;
+    try {
+      const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=refresh_token`, {
+        method: "POST", headers: this._h(),
+        body: JSON.stringify({ refresh_token: this._refreshToken }),
+      });
+      const d = await r.json() as { access_token?: string; refresh_token?: string; user?: SupabaseUser };
+      if (d.access_token) {
+        this._token = d.access_token;
+        this._refreshToken = d.refresh_token ?? this._refreshToken;
+        this._user  = d.user ?? this._user;
+        this._save();
+        return true;
+      }
+    } catch (_) { /* ignore */ }
+    return false;
+  },
+
+  async signUp(email: string, password: string): Promise<Record<string, unknown>> {
+    const r = await fetch(`${SB_URL}/auth/v1/signup`, {
+      method: "POST", headers: this._h(),
+      body: JSON.stringify({ email, password }),
+    });
+    const d = await r.json() as Record<string, unknown>;
+    if (d.access_token) {
+      this._token = d.access_token as string;
+      this._refreshToken = (d.refresh_token as string) ?? null;
+      this._user  = d.user as SupabaseUser;
+      this._save();
+    }
+    return d;
+  },
+
+  async signIn(email: string, password: string): Promise<Record<string, unknown>> {
+    const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, {
+      method: "POST", headers: this._h(),
+      body: JSON.stringify({ email, password }),
+    });
+    const d = await r.json() as Record<string, unknown>;
+    if (d.access_token) {
+      this._token = d.access_token as string;
+      this._refreshToken = (d.refresh_token as string) ?? null;
+      this._user  = d.user as SupabaseUser;
+      this._save();
+    }
+    return d;
+  },
+
+  async signOut(): Promise<void> {
+    try { await fetch(`${SB_URL}/auth/v1/logout`, { method: "POST", headers: this._h() }); } catch (_) { /* ignore */ }
+    this._clear();
+  },
+
+  async select<T = unknown>(table: string, qs = ""): Promise<T[]> {
+    const r = await fetch(`${SB_URL}/rest/v1/${table}?${qs}`, { headers: this._h() });
+    if (!r.ok) { if (r.status === 401) await this.refresh(); return []; }
+    return r.json() as Promise<T[]>;
+  },
+
+  async insert<T = unknown>(table: string, data: Record<string, unknown>): Promise<T[]> {
+    const r = await fetch(`${SB_URL}/rest/v1/${table}`, {
+      method: "POST", headers: this._h(),
+      body: JSON.stringify(data),
+    });
+    if (!r.ok) { const e = await r.json() as { message?: string }; throw new Error(e.message ?? "Insert failed"); }
+    return r.json() as Promise<T[]>;
+  },
+
+  async update<T = unknown>(table: string, data: Record<string, unknown>, match: Record<string, string | number | boolean>): Promise<T[]> {
+    const q = Object.entries(match).map(([k, v]) => `${k}=eq.${encodeURIComponent(String(v))}`).join("&");
+    const r = await fetch(`${SB_URL}/rest/v1/${table}?${q}`, {
+      method: "PATCH", headers: this._h(),
+      body: JSON.stringify(data),
+    });
+    if (!r.ok) { const e = await r.json() as { message?: string }; throw new Error(e.message ?? "Update failed"); }
+    return r.json() as Promise<T[]>;
+  },
+
+  async del(table: string, match: Record<string, string | number | boolean>): Promise<boolean> {
+    const q = Object.entries(match).map(([k, v]) => `${k}=eq.${encodeURIComponent(String(v))}`).join("&");
+    const r = await fetch(`${SB_URL}/rest/v1/${table}?${q}`, { method: "DELETE", headers: this._h() });
+    return r.ok;
+  },
+};
+
+// ─── UTILS ────────────────────────────────────────────────────────────────────
+const genKey = (): string => {
+  const s = () => Math.random().toString(36).substring(2, 7).toUpperCase().padEnd(5, "X");
+  return `${s()}-${s()}-${s()}-${s()}`;
+};
+const fmt = (d: string | null | undefined): string =>
+  d ? new Date(d).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" }) : "—";
+const isExpired = (d: string | null | undefined): boolean =>
+  !!d && new Date(d) < new Date();
+
+// ─── FRAMEWORKS ───────────────────────────────────────────────────────────────
+const FRAMEWORKS: Framework[] = [
+  { id: "laravel",     name: "Laravel",     lang: "PHP",        icon: "🔴", pkg: "composer", color: "#FF2D20" },
+  { id: "codeigniter", name: "CodeIgniter", lang: "PHP",        icon: "🔥", pkg: "composer", color: "#EF4E23" },
+  { id: "react",       name: "React",       lang: "JavaScript", icon: "⚛️", pkg: "npm",      color: "#61DAFB" },
+  { id: "vue",         name: "Vue.js",      lang: "JavaScript", icon: "💚", pkg: "npm",      color: "#42b883" },
+  { id: "nextjs",      name: "Next.js",     lang: "JavaScript", icon: "◆",  pkg: "npm",      color: "#ffffff" },
+  { id: "django",      name: "Django",      lang: "Python",     icon: "🐍", pkg: "pip",      color: "#092E20" },
+  { id: "flask",       name: "Flask",       lang: "Python",     icon: "🧪", pkg: "pip",      color: "#000000" },
+  { id: "express",     name: "Express.js",  lang: "JavaScript", icon: "🚂", pkg: "npm",      color: "#444444" },
+  { id: "wordpress",   name: "WordPress",   lang: "PHP",        icon: "🅦",  pkg: "manual",   color: "#21759B" },
+  { id: "dotnet",      name: ".NET / C#",   lang: "C#",         icon: "💜", pkg: "nuget",    color: "#512BD4" },
+];
+
+type FrameworkId = "laravel" | "codeigniter" | "react" | "vue" | "nextjs" | "django" | "flask" | "express" | "wordpress" | "dotnet";
+
+const AUTO_INSTALL: Record<FrameworkId, { bash: (key: string) => string; verify: (key: string) => string }> = {
+  laravel: {
+    bash: (key: string) => `#!/bin/bash
+# LicenseHub Auto-Installer — Laravel
+set -e
+echo "🔑 LicenseHub — Laravel Auto-Installer"
+mkdir -p config app/Services app/Http/Middleware
+
+cat > config/license.php << 'PHPEOF'
+<?php
+return [
+    'supabase_url' => env('SUPABASE_URL', 'https://gdmknaditlpfjcplsygc.supabase.co'),
+    'supabase_key' => env('SUPABASE_KEY'),
+    'license_key'  => env('LICENSE_KEY'),
+    'domain'       => env('APP_URL'),
+];
+PHPEOF
+
+cat > app/Services/LicenseValidator.php << 'PHPEOF'
+<?php
+namespace App\\Services;
+class LicenseValidator {
+    public function __construct(private array $config) {}
+    public function validate(): array {
+        $url = $this->config['supabase_url'] . '/rest/v1/lh_licenses?key=eq.' . urlencode($this->config['license_key']);
+        $headers = ["apikey: {$this->config['supabase_key']}", "Authorization: Bearer {$this->config['supabase_key']}"];
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HTTPHEADER => $headers]);
+        $data = json_decode(curl_exec($ch), true);
+        curl_close($ch);
+        $lic = $data[0] ?? null;
+        if (!$lic) return $this->_log('invalid', null);
+        if ($lic['status'] === 'suspended') return $this->_log('suspended', $lic);
+        if ($lic['status'] === 'expired' || (!empty($lic['expires_at']) && strtotime($lic['expires_at']) < time())) return $this->_log('expired', $lic);
+        if (($lic['max_activations'] ?? 0) > 0 && ($lic['activations'] ?? 0) >= $lic['max_activations']) return $this->_log('quota_exceeded', $lic);
+        return $this->_log('valid', $lic);
+    }
+    private function _log(string $result, ?array $lic): array {
+        $ch = curl_init($this->config['supabase_url'] . '/rest/v1/lh_validation_logs');
+        curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POSTFIELDS => json_encode(['license_id' => $lic['id'] ?? null, 'license_key' => $this->config['license_key'], 'framework' => 'laravel', 'result' => $result]),
+            CURLOPT_HTTPHEADER => ["apikey: {$this->config['supabase_key']}", "Authorization: Bearer {$this->config['supabase_key']}", "Content-Type: application/json"],
+        ]);
+        curl_exec($ch); curl_close($ch);
+        return ['valid' => $result === 'valid', 'result' => $result];
+    }
+}
+PHPEOF
+
+cat > app/Http/Middleware/ValidateLicense.php << 'PHPEOF'
+<?php
+namespace App\\Http\\Middleware;
+use App\\Services\\LicenseValidator;
+use Closure;
+use Illuminate\\Http\\Request;
+class ValidateLicense {
+    public function handle(Request $request, Closure $next) {
+        $r = (new LicenseValidator(config('license')))->validate();
+        if (!$r['valid']) abort(403, 'License ' . $r['result']);
+        return $next($request);
+    }
+}
+PHPEOF
+
+grep -q "SUPABASE_URL" .env 2>/dev/null || cat >> .env << 'ENVEOF'
+
+SUPABASE_URL=https://gdmknaditlpfjcplsygc.supabase.co
+SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+LICENSE_KEY=${key}
+ENVEOF
+
+echo "✅ Done! Register middleware in app/Http/Kernel.php"
+`,
+    verify: (_key: string) => `php artisan tinker --execute="use App\\\\Services\\\\LicenseValidator; print_r((new LicenseValidator(config('license')))->validate());"`,
+  },
+
+  codeigniter: {
+    bash: (key: string) => `#!/bin/bash
+# LicenseHub Auto-Installer — CodeIgniter 4
+set -e
+echo "🔑 LicenseHub — CodeIgniter 4 Auto-Installer"
+mkdir -p app/Config app/Services app/Filters
+
+cat > app/Services/LicenseValidator.php << 'PHPEOF'
+<?php
+namespace App\\Services;
+class LicenseValidator {
+    private string $sbUrl;
+    private string $sbKey;
+    private string $licKey;
+    public function __construct() {
+        $this->sbUrl  = env('license.supabaseUrl', 'https://gdmknaditlpfjcplsygc.supabase.co');
+        $this->sbKey  = env('license.supabaseKey', '');
+        $this->licKey = env('license.licenseKey', '');
+    }
+    public function validate(): array {
+        $ch = curl_init($this->sbUrl . '/rest/v1/lh_licenses?key=eq.' . urlencode($this->licKey));
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HTTPHEADER => ["apikey: $this->sbKey", "Authorization: Bearer $this->sbKey"]]);
+        $data = json_decode(curl_exec($ch), true); curl_close($ch);
+        $lic = $data[0] ?? null;
+        $result = !$lic ? 'invalid' : ($lic['status'] === 'suspended' ? 'suspended' : ($lic['status'] === 'expired' ? 'expired' : 'valid'));
+        return ['valid' => $result === 'valid', 'result' => $result];
+    }
+}
+PHPEOF
+
+cat > app/Filters/LicenseFilter.php << 'PHPEOF'
+<?php
+namespace App\\Filters;
+use App\\Services\\LicenseValidator;
+use CodeIgniter\\HTTP\\RequestInterface;
+use CodeIgniter\\HTTP\\ResponseInterface;
+use CodeIgniter\\Filters\\FilterInterface;
+class LicenseFilter implements FilterInterface {
+    public function before(RequestInterface $request, $arguments = null) {
+        $r = (new LicenseValidator())->validate();
+        if (!$r['valid']) return service('response')->setStatusCode(403)->setBody('License: ' . $r['result']);
+    }
+    public function after(RequestInterface $request, ResponseInterface $response, $arguments = null) {}
+}
+PHPEOF
+
+grep -q "license.licenseKey" .env 2>/dev/null || cat >> .env << 'ENVEOF'
+
+license.supabaseKey = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+license.licenseKey  = ${key}
+ENVEOF
+
+echo "✅ Done! Register LicenseFilter in app/Config/Filters.php"
+`,
+    verify: (_key: string) => `php spark test`,
+  },
+
+  react: {
+    bash: (key: string) => `#!/bin/bash
+# LicenseHub Auto-Installer — React
+set -e
+echo "🔑 LicenseHub — React Auto-Installer"
+npm install @supabase/supabase-js
+mkdir -p src/lib src/hooks src/components
+
+cat > src/lib/license.ts << 'EOF'
+export const LH_CONFIG = {
+  supabaseUrl: import.meta.env.VITE_SUPABASE_URL as string || "https://gdmknaditlpfjcplsygc.supabase.co",
+  supabaseKey: import.meta.env.VITE_SUPABASE_KEY as string,
+  licenseKey:  import.meta.env.VITE_LICENSE_KEY as string,
+};
+const h = () => ({ apikey: LH_CONFIG.supabaseKey, Authorization: \`Bearer \${LH_CONFIG.supabaseKey}\`, "Content-Type": "application/json" });
+export async function validateLicense(domain = window.location.hostname) {
+  const res = await fetch(\`\${LH_CONFIG.supabaseUrl}/rest/v1/lh_licenses?key=eq.\${LH_CONFIG.licenseKey}\`, { headers: h() });
+  const [lic] = await res.json();
+  const result = !lic ? "invalid" : lic.status === "suspended" ? "suspended" : lic.status === "expired" || (lic.expires_at && new Date(lic.expires_at) < new Date()) ? "expired" : lic.max_activations > 0 && lic.activations >= lic.max_activations ? "quota_exceeded" : lic.allowed_domains?.length && !lic.allowed_domains.includes(domain) ? "domain_mismatch" : "valid";
+  await fetch(\`\${LH_CONFIG.supabaseUrl}/rest/v1/lh_validation_logs\`, { method: "POST", headers: h(), body: JSON.stringify({ license_id: lic?.id, license_key: LH_CONFIG.licenseKey, domain, framework: "react", result }) });
+  return { valid: result === "valid", result, license: lic };
+}
+EOF
+
+grep -q "VITE_LICENSE_KEY" .env 2>/dev/null || cat >> .env << 'ENVEOF'
+
+VITE_SUPABASE_URL=https://gdmknaditlpfjcplsygc.supabase.co
+VITE_SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+VITE_LICENSE_KEY=${key}
+ENVEOF
+
+echo "✅ Done! Import validateLicense from src/lib/license.ts"
+`,
+    verify: (_key: string) => `npx tsc --noEmit`,
+  },
+
+  vue: {
+    bash: (key: string) => `#!/bin/bash
+# LicenseHub Auto-Installer — Vue 3
+set -e
+echo "🔑 LicenseHub — Vue 3 Auto-Installer"
+npm install @supabase/supabase-js
+mkdir -p src/composables
+
+cat > src/composables/useLicense.ts << 'EOF'
+import { ref, onMounted } from "vue";
+const SB  = import.meta.env.VITE_SUPABASE_URL as string;
+const KEY = import.meta.env.VITE_SUPABASE_KEY as string;
+const LIC = import.meta.env.VITE_LICENSE_KEY as string;
+export function useLicense() {
+  const valid = ref(false); const loading = ref(true); const result = ref("");
+  onMounted(async () => {
+    const r = await fetch(\`\${SB}/rest/v1/lh_licenses?key=eq.\${LIC}\`, { headers: { apikey: KEY, Authorization: \`Bearer \${KEY}\` } });
+    const [lic] = await r.json();
+    const res = !lic ? "invalid" : lic.status !== "active" ? lic.status : "valid";
+    valid.value = res === "valid"; result.value = res; loading.value = false;
+  });
+  return { valid, loading, result };
+}
+EOF
+
+grep -q "VITE_LICENSE_KEY" .env 2>/dev/null || echo -e "\\nVITE_SUPABASE_URL=https://gdmknaditlpfjcplsygc.supabase.co\\nVITE_SUPABASE_KEY=...\\nVITE_LICENSE_KEY=${key}" >> .env
+echo "✅ Done!"
+`,
+    verify: (_key: string) => `npx vue-tsc --noEmit`,
+  },
+
+  nextjs: {
+    bash: (key: string) => `#!/bin/bash
+# LicenseHub Auto-Installer — Next.js
+set -e
+echo "🔑 LicenseHub — Next.js Auto-Installer"
+npm install @supabase/supabase-js
+
+cat > middleware.ts << 'EOF'
+import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+const SB  = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const KEY = process.env.NEXT_PUBLIC_SUPABASE_KEY!;
+const LIC = process.env.LICENSE_KEY!;
+export async function middleware(request: NextRequest) {
+  const res = await fetch(\`\${SB}/rest/v1/lh_licenses?key=eq.\${LIC}\`, { headers: { apikey: KEY, Authorization: \`Bearer \${KEY}\` }, cache: "no-store" });
+  const [lic] = await res.json();
+  const valid = lic && lic.status === "active" && !(lic.expires_at && new Date(lic.expires_at) < new Date());
+  if (!valid) return NextResponse.redirect(new URL("/license-error", request.url));
+  return NextResponse.next();
+}
+export const config = { matcher: ["/((?!_next|api/license|license-error).*)"] };
+EOF
+
+grep -q "LICENSE_KEY" .env.local 2>/dev/null || cat >> .env.local << 'ENVEOF'
+
+NEXT_PUBLIC_SUPABASE_URL=https://gdmknaditlpfjcplsygc.supabase.co
+NEXT_PUBLIC_SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+LICENSE_KEY=${key}
+ENVEOF
+
+echo "✅ Done! middleware.ts will validate every request."
+`,
+    verify: (_key: string) => `npx tsc --noEmit`,
+  },
+
+  django: {
+    bash: (key: string) => `#!/bin/bash
+# LicenseHub Auto-Installer — Django
+set -e
+echo "🔑 LicenseHub — Django Auto-Installer"
+pip install requests python-dotenv --quiet
+mkdir -p licensehub
+touch licensehub/__init__.py
+
+cat > licensehub/validator.py << 'EOF'
+import os, requests
+from datetime import datetime, timezone
+
+SB_URL  = os.environ.get("SUPABASE_URL", "https://gdmknaditlpfjcplsygc.supabase.co")
+SB_KEY  = os.environ.get("SUPABASE_KEY", "")
+LIC_KEY = os.environ.get("LICENSE_KEY", "")
+HEADERS = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}", "Content-Type": "application/json"}
+
+def validate_license(domain: str = "") -> dict:
+    try:
+        r   = requests.get(f"{SB_URL}/rest/v1/lh_licenses?key=eq.{LIC_KEY}", headers=HEADERS, timeout=5)
+        lic = (r.json() or [None])[0]
+    except Exception:
+        return {"valid": False, "result": "error"}
+    if not lic: result = "invalid"
+    elif lic.get("status") == "suspended": result = "suspended"
+    elif lic.get("status") == "expired": result = "expired"
+    elif lic.get("expires_at") and datetime.fromisoformat(lic["expires_at"]) < datetime.now(timezone.utc): result = "expired"
+    elif lic.get("max_activations", 0) > 0 and (lic.get("activations") or 0) >= lic["max_activations"]: result = "quota_exceeded"
+    else: result = "valid"
+    try: requests.post(f"{SB_URL}/rest/v1/lh_validation_logs", headers=HEADERS, json={"license_key": LIC_KEY, "domain": domain, "framework": "django", "result": result}, timeout=3)
+    except Exception: pass
+    return {"valid": result == "valid", "result": result}
+EOF
+
+cat > licensehub/middleware.py << 'EOF'
+from django.http import HttpResponseForbidden
+from .validator import validate_license
+class LicenseMiddleware:
+    def __init__(self, get_response): self.get_response = get_response; self._cache = None
+    def __call__(self, request):
+        if not self._cache or self._cache.get("result") != "valid":
+            self._cache = validate_license(request.get_host())
+        if not self._cache["valid"]: return HttpResponseForbidden(f"License {self._cache['result']}")
+        return self.get_response(request)
+EOF
+
+grep -q "LICENSE_KEY" .env 2>/dev/null || printf "\\nSUPABASE_URL=https://gdmknaditlpfjcplsygc.supabase.co\\nSUPABASE_KEY=...\\nLICENSE_KEY=${key}\\n" >> .env
+echo "✅ Done! Add licensehub.middleware.LicenseMiddleware to MIDDLEWARE in settings.py"
+`,
+    verify: (_key: string) => `python -c "from licensehub.validator import validate_license; print(validate_license())"`,
+  },
+
+  flask: {
+    bash: (key: string) => `#!/bin/bash
+# LicenseHub Auto-Installer — Flask
+set -e
+echo "🔑 LicenseHub — Flask Auto-Installer"
+pip install requests flask python-dotenv --quiet
+
+cat > licensehub.py << 'EOF'
+import os, requests
+from flask import Flask, abort
+_SB  = os.environ.get("SUPABASE_URL", "https://gdmknaditlpfjcplsygc.supabase.co")
+_KEY = os.environ.get("SUPABASE_KEY", "")
+_LIC = os.environ.get("LICENSE_KEY", "")
+_H   = {"apikey": _KEY, "Authorization": f"Bearer {_KEY}", "Content-Type": "application/json"}
+_CACHE: dict = {}
+def validate_license(domain: str = "") -> dict:
+    global _CACHE
+    if _CACHE.get("result") == "valid": return _CACHE
+    try:
+        lic = (requests.get(f"{_SB}/rest/v1/lh_licenses?key=eq.{_LIC}", headers=_H, timeout=5).json() or [None])[0]
+    except Exception: return {"valid": False, "result": "error"}
+    result = "invalid" if not lic else ("suspended" if lic.get("status")=="suspended" else ("expired" if lic.get("status")=="expired" else "valid"))
+    try: requests.post(f"{_SB}/rest/v1/lh_validation_logs", headers=_H, json={"license_key": _LIC, "domain": domain, "framework": "flask", "result": result}, timeout=3)
+    except Exception: pass
+    _CACHE = {"valid": result == "valid", "result": result}
+    return _CACHE
+def init_license(app: Flask):
+    @app.before_request
+    def check():
+        r = validate_license()
+        if not r["valid"]: abort(403, f"License {r['result']}")
+EOF
+
+grep -q "LICENSE_KEY" .env 2>/dev/null || printf "\\nSUPABASE_URL=https://gdmknaditlpfjcplsygc.supabase.co\\nSUPABASE_KEY=...\\nLICENSE_KEY=${key}\\n" >> .env
+echo "✅ Done! In app.py: from licensehub import init_license; init_license(app)"
+`,
+    verify: (_key: string) => `python -c "from licensehub import validate_license; print(validate_license())"`,
+  },
+
+  express: {
+    bash: (key: string) => `#!/bin/bash
+# LicenseHub Auto-Installer — Express.js
+set -e
+echo "🔑 LicenseHub — Express.js Auto-Installer"
+npm install node-fetch dotenv
+mkdir -p middleware
+
+cat > middleware/license.js << 'EOF'
+const fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args));
+require("dotenv").config();
+const SB  = process.env.SUPABASE_URL || "https://gdmknaditlpfjcplsygc.supabase.co";
+const KEY = process.env.SUPABASE_KEY;
+const LIC = process.env.LICENSE_KEY;
+const H   = { apikey: KEY, Authorization: \`Bearer \${KEY}\`, "Content-Type": "application/json" };
+let _cache = null;
+async function validateLicense(domain) {
+  if (_cache?.result === "valid") return _cache;
+  const [lic] = await fetch(\`\${SB}/rest/v1/lh_licenses?key=eq.\${LIC}\`, { headers: H }).then(r => r.json());
+  const result = !lic ? "invalid" : lic.status === "suspended" ? "suspended" : lic.status === "expired" ? "expired" : "valid";
+  fetch(\`\${SB}/rest/v1/lh_validation_logs\`, { method: "POST", headers: H, body: JSON.stringify({ license_key: LIC, domain, framework: "express", result }) }).catch(() => {});
+  _cache = { valid: result === "valid", result };
+  return _cache;
+}
+module.exports = async (req, res, next) => {
+  const r = await validateLicense(req.hostname);
+  if (!r.valid) return res.status(403).json({ error: "License " + r.result });
+  next();
+};
+EOF
+
+grep -q "LICENSE_KEY" .env 2>/dev/null || printf "\\nSUPABASE_URL=https://gdmknaditlpfjcplsygc.supabase.co\\nSUPABASE_KEY=...\\nLICENSE_KEY=${key}\\n" >> .env
+echo "✅ Done! In app.js: app.use(require('./middleware/license'));"
+`,
+    verify: (_key: string) => `node -e "require('./middleware/license')()"`,
+  },
+
+  wordpress: {
+    bash: (key: string) => `#!/bin/bash
+# LicenseHub Auto-Installer — WordPress
+set -e
+echo "🔑 LicenseHub — WordPress Auto-Installer"
+mkdir -p wp-content/mu-plugins
+
+cat > wp-content/mu-plugins/licensehub.php << 'PHPEOF'
+<?php
+/**
+ * Plugin Name: LicenseHub Validator
+ * Description: Auto-validates license on every WordPress request.
+ */
+defined('ABSPATH') || exit;
+define('LH_SB_URL',  defined('SUPABASE_URL')  ? SUPABASE_URL  : 'https://gdmknaditlpfjcplsygc.supabase.co');
+define('LH_SB_KEY',  defined('SUPABASE_KEY')  ? SUPABASE_KEY  : '');
+define('LH_LIC_KEY', defined('LICENSE_KEY')   ? LICENSE_KEY   : '');
+add_action('init', function() {
+    if (is_admin() || wp_doing_ajax() || wp_doing_cron()) return;
+    $cached = get_transient('lh_' . md5(LH_LIC_KEY));
+    if ($cached === 'valid') return;
+    $res = wp_remote_get(LH_SB_URL . '/rest/v1/lh_licenses?key=eq.' . urlencode(LH_LIC_KEY), ['headers' => ['apikey' => LH_SB_KEY, 'Authorization' => 'Bearer ' . LH_SB_KEY], 'timeout' => 5]);
+    if (is_wp_error($res)) return;
+    $lic = json_decode(wp_remote_retrieve_body($res), true)[0] ?? null;
+    $result = !$lic ? 'invalid' : ($lic['status'] !== 'active' ? $lic['status'] : 'valid');
+    if ($result === 'valid') { set_transient('lh_' . md5(LH_LIC_KEY), 'valid', HOUR_IN_SECONDS); }
+    else { wp_die('🔐 License ' . esc_html($result) . '. Contact your administrator.', 'License Error', ['response' => 403]); }
+});
+PHPEOF
+
+[ -f wp-config.php ] && ! grep -q "LH_LICENSE_KEY" wp-config.php && sed -i "s/\\/\\* That's all/define('SUPABASE_URL','https:\\/\\/gdmknaditlpfjcplsygc.supabase.co');\ndefine('SUPABASE_KEY','...');\ndefine('LICENSE_KEY','${key}');\n\\/\\* That's all/" wp-config.php || true
+echo "✅ Done! MU plugin installed. Set SUPABASE_KEY + LICENSE_KEY in wp-config.php"
+`,
+    verify: (_key: string) => `wp eval "echo (new WP_Http())->get(home_url())['response']['code'];"`,
+  },
+
+  dotnet: {
+    bash: (key: string) => `#!/bin/bash
+# LicenseHub Auto-Installer — .NET / C#
+set -e
+echo "🔑 LicenseHub — .NET Auto-Installer"
+dotnet add package Microsoft.Extensions.Http --version 8.0.0 2>/dev/null || true
+mkdir -p LicenseHub
+
+cat > LicenseHub/LicenseValidator.cs << 'EOF'
+using System;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+
+namespace LicenseHub;
+
+public record LicenseResult(bool Valid, string Result);
+
+public class LicenseValidator(IConfiguration config)
+{
+    private readonly string _sbUrl  = config["LicenseHub:SupabaseUrl"] ?? "https://gdmknaditlpfjcplsygc.supabase.co";
+    private readonly string _sbKey  = config["LicenseHub:SupabaseKey"] ?? "";
+    private readonly string _licKey = config["LicenseHub:LicenseKey"]  ?? "";
+    private static LicenseResult? _cache;
+
+    public async Task<LicenseResult> ValidateAsync(string? domain = null)
+    {
+        if (_cache?.Result == "valid") return _cache;
+        using var http = new HttpClient();
+        http.DefaultRequestHeaders.Add("apikey", _sbKey);
+        http.DefaultRequestHeaders.Add("Authorization", \$"Bearer {_sbKey}");
+        var body = await (await http.GetAsync(\$"{_sbUrl}/rest/v1/lh_licenses?key=eq.{_licKey}")).Content.ReadAsStringAsync();
+        var arr  = JsonSerializer.Deserialize<JsonElement[]>(body);
+        var lic  = arr?.Length > 0 ? arr[0] : (JsonElement?)null;
+        var status = lic?.GetProperty("status").GetString();
+        var result = lic == null ? "invalid" : status == "suspended" ? "suspended" : status == "expired" ? "expired" : "valid";
+        var logPayload = JsonSerializer.Serialize(new { license_key = _licKey, domain, framework = "dotnet", result });
+        await http.PostAsync(\$"{_sbUrl}/rest/v1/lh_validation_logs", new StringContent(logPayload, Encoding.UTF8, "application/json"));
+        _cache = new LicenseResult(result == "valid", result);
+        return _cache;
+    }
+}
+
+public class LicenseMiddleware(RequestDelegate next, LicenseValidator validator)
+{
+    public async Task InvokeAsync(Microsoft.AspNetCore.Http.HttpContext ctx)
+    {
+        var r = await validator.ValidateAsync(ctx.Request.Host.Host);
+        if (!r.Valid) { ctx.Response.StatusCode = 403; await ctx.Response.WriteAsync(\$"License {r.Result}"); return; }
+        await next(ctx);
+    }
+}
+EOF
+
+[ -f appsettings.json ] && ! grep -q "LicenseHub" appsettings.json && node -e "
+const fs=require('fs'),f='appsettings.json';
+const c=JSON.parse(fs.readFileSync(f));
+c.LicenseHub={SupabaseUrl:'https://gdmknaditlpfjcplsygc.supabase.co',SupabaseKey:'...',LicenseKey:'${key}'};
+fs.writeFileSync(f,JSON.stringify(c,null,2));
+" 2>/dev/null || true
+
+echo "✅ Done!"
+echo "In Program.cs:"
+echo "  builder.Services.AddSingleton<LicenseValidator>();"
+echo "  app.UseMiddleware<LicenseMiddleware>();"
+`,
+    verify: (_key: string) => `dotnet build --nologo -q`,
+  },
+};
+
+const SQL_SCHEMA = `-- LicenseHub Schema — Project: gdmknaditlpfjcplsygc
+create table if not exists lh_products (
+  id uuid primary key default gen_random_uuid(), name text not null,
+  description text, owner_id uuid references auth.users(id) on delete cascade,
+  created_at timestamptz default now()
+);
+create table if not exists lh_licenses (
+  id uuid primary key default gen_random_uuid(), key text unique not null,
+  product_id uuid references lh_products(id) on delete set null,
+  owner_id uuid references auth.users(id) on delete cascade,
+  status text check (status in ('active','expired','suspended','trial')) default 'active',
+  allowed_domains text[], allowed_ips text[], expires_at date,
+  max_activations int default 1, activations int default 0,
+  customer_email text, customer_name text, notes text, metadata jsonb default '{}',
+  created_at timestamptz default now(), updated_at timestamptz default now()
+);
+create table if not exists lh_activations (
+  id uuid primary key default gen_random_uuid(),
+  license_id uuid references lh_licenses(id) on delete cascade,
+  domain text, ip_address text, framework text, activated_at timestamptz default now()
+);
+create table if not exists lh_validation_logs (
+  id uuid primary key default gen_random_uuid(),
+  license_id uuid references lh_licenses(id) on delete set null,
+  license_key text not null, domain text, ip_address text, framework text,
+  result text check (result in ('valid','invalid','expired','suspended','domain_mismatch','quota_exceeded')),
+  created_at timestamptz default now()
+);
+create or replace function update_updated_at() returns trigger as $$ begin new.updated_at=now(); return new; end; $$ language plpgsql;
+create trigger lh_licenses_updated before update on lh_licenses for each row execute function update_updated_at();
+alter table lh_products enable row level security;
+alter table lh_licenses enable row level security;
+alter table lh_activations enable row level security;
+alter table lh_validation_logs enable row level security;
+create policy "owner_products"  on lh_products        for all using (auth.uid()=owner_id);
+create policy "owner_licenses"  on lh_licenses        for all using (auth.uid()=owner_id);
+create policy "owner_acts"      on lh_activations     for select using (license_id in (select id from lh_licenses where owner_id=auth.uid()));
+create policy "owner_logs"      on lh_validation_logs for select using (license_id in (select id from lh_licenses where owner_id=auth.uid()));
+create policy "anon_read_lic"   on lh_licenses        for select to anon using (true);
+create policy "anon_log"        on lh_validation_logs for insert to anon with check (true);
+create policy "anon_activate"   on lh_activations     for insert to anon with check (true);`;
+
+// ─── STYLES ───────────────────────────────────────────────────────────────────
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Sora:wght@300;400;500;600;700&display=swap');
+:root{--bg:#07080f;--s1:#0f1018;--s2:#171824;--s3:#1e2030;--bd:#252840;--a:#6c63ff;--a2:#00d4aa;--a3:#ff9f43;--red:#ff5c5c;--grn:#2ecc71;--warn:#f0a500;--tx:#e2e4f0;--mu:#5a5d7a;--mono:'IBM Plex Mono',monospace;--sans:'Sora',sans-serif;--r:10px}
+*{box-sizing:border-box;margin:0;padding:0}html,body{height:100%;overflow:hidden}
+body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:13.5px;line-height:1.6}
+::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}
+a{color:var(--a2);text-decoration:none}a:hover{text-decoration:underline}
+.shell{display:flex;height:100vh;overflow:hidden}
+.sidebar{width:228px;min-width:228px;background:var(--s1);border-right:1px solid var(--bd);display:flex;flex-direction:column;overflow:hidden}
+.logo{padding:18px 16px 14px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:11px}
+.logo-glyph{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--a),var(--a2));display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0;box-shadow:0 0 18px rgba(108,99,255,.35)}
+.logo-name{font-family:var(--mono);font-size:13.5px;font-weight:600;color:var(--tx);line-height:1.1}
+.logo-tag{font-size:9.5px;color:var(--mu);letter-spacing:.07em;text-transform:uppercase}
+.nav{flex:1;overflow-y:auto;padding:10px 8px}.nav-group{margin-bottom:16px}
+.nav-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:var(--mu);padding:0 10px;margin-bottom:3px}
+.nav-btn{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:7px;cursor:pointer;color:var(--mu);font-size:12.5px;font-weight:500;transition:all .13s;border:none;background:none;width:100%;text-align:left;font-family:var(--sans)}
+.nav-btn:hover{background:var(--s2);color:var(--tx)}.nav-btn.on{background:rgba(108,99,255,.15);color:var(--a)}
+.nav-btn .ico{font-size:14px;width:18px;text-align:center;flex-shrink:0}
+.nb-count{margin-left:auto;background:var(--a);color:#fff;font-size:9.5px;font-weight:700;border-radius:10px;padding:1px 6px;font-family:var(--mono)}
+.sb-foot{padding:12px 16px;border-top:1px solid var(--bd);font-size:11px;color:var(--mu)}
+.sb-user{font-size:12px;color:var(--tx);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}.dot-on{background:var(--grn);animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+.topbar{height:56px;min-height:56px;background:var(--s1);border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;padding:0 24px;flex-shrink:0}
+.topbar-title{font-size:14.5px;font-weight:600}.topbar-right{display:flex;gap:7px;align-items:center}
+.content{flex:1;overflow-y:auto;padding:22px 24px}
+.btn{padding:7px 14px;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;border:none;font-family:var(--sans);transition:all .13s;display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.btn-primary{background:var(--a);color:#fff}.btn-primary:hover{background:#5b53e8;box-shadow:0 0 14px rgba(108,99,255,.35)}
+.btn-ghost{background:transparent;color:var(--mu);border:1px solid var(--bd)}.btn-ghost:hover{color:var(--tx);border-color:var(--mu)}
+.btn-danger{background:rgba(255,92,92,.1);color:var(--red);border:1px solid rgba(255,92,92,.2)}.btn-danger:hover{background:rgba(255,92,92,.2)}
+.btn-success{background:rgba(46,204,113,.1);color:var(--grn);border:1px solid rgba(46,204,113,.2)}.btn-success:hover{background:rgba(46,204,113,.2)}
+.btn-teal{background:rgba(0,212,170,.12);color:var(--a2);border:1px solid rgba(0,212,170,.25)}.btn-teal:hover{background:rgba(0,212,170,.22)}
+.btn-sm{padding:5px 10px;font-size:11.5px}.btn-xs{padding:3px 8px;font-size:11px}.btn:disabled{opacity:.4;cursor:not-allowed}
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:var(--r);padding:16px 18px}
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.stat-card{background:var(--s1);border:1px solid var(--bd);border-radius:var(--r);padding:14px 16px;position:relative;overflow:hidden}
+.stat-card::after{content:'';position:absolute;top:0;right:0;width:70px;height:70px;border-radius:50%;transform:translate(30%,-30%);opacity:.08}
+.stat-card.c1::after{background:var(--a)}.stat-card.c2::after{background:var(--a2)}.stat-card.c3::after{background:var(--a3)}.stat-card.c4::after{background:var(--red)}
+.stat-ico{font-size:20px;margin-bottom:6px}.stat-lbl{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--mu);margin-bottom:4px}
+.stat-val{font-size:28px;font-weight:700;font-family:var(--mono);color:var(--tx);line-height:1}.stat-delta{font-size:11px;color:var(--grn);margin-top:4px}.stat-delta.bad{color:var(--red)}
+.tbl-wrap{background:var(--s1);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;margin-bottom:20px}
+.tbl-head{padding:12px 16px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.tbl-title{font-size:13px;font-weight:600}
+table{width:100%;border-collapse:collapse}
+th{padding:8px 12px;font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:var(--mu);text-align:left;font-weight:600;background:rgba(255,255,255,.018);border-bottom:1px solid var(--bd)}
+td{padding:10px 12px;font-size:12.5px;border-bottom:1px solid rgba(37,40,64,.5);vertical-align:middle}
+tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.01)}
+.key-mono{font-family:var(--mono);font-size:11px;color:var(--a2);letter-spacing:.05em}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
+.b-active{background:rgba(46,204,113,.12);color:var(--grn)}.b-expired{background:rgba(255,92,92,.12);color:var(--red)}.b-trial{background:rgba(255,159,67,.12);color:var(--a3)}.b-suspended{background:rgba(90,93,122,.15);color:var(--mu)}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.78);display:flex;align-items:center;justify-content:center;z-index:200;backdrop-filter:blur(6px);animation:fo .15s ease}
+@keyframes fo{from{opacity:0}to{opacity:1}}
+.modal{background:var(--s2);border:1px solid var(--bd);border-radius:13px;padding:24px;width:510px;max-height:90vh;overflow-y:auto;animation:su .17s ease}
+.modal-lg{width:700px}.modal-xl{width:920px}
+@keyframes su{from{transform:translateY(9px);opacity:0}to{transform:translateY(0);opacity:1}}
+.modal-title{font-size:16px;font-weight:700;margin-bottom:3px}.modal-sub{font-size:12px;color:var(--mu);margin-bottom:20px}
+.modal-foot{display:flex;justify-content:flex-end;gap:7px;margin-top:20px;padding-top:16px;border-top:1px solid var(--bd)}
+.fg{margin-bottom:12px}.fg label{display:block;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--mu);margin-bottom:4px}
+.fr{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+input,select,textarea{width:100%;background:var(--s3);border:1px solid var(--bd);border-radius:7px;padding:7px 10px;color:var(--tx);font-family:var(--sans);font-size:12.5px;outline:none;transition:border-color .13s}
+input:focus,select:focus,textarea:focus{border-color:var(--a)}select option{background:var(--s2)}textarea{resize:vertical;min-height:64px}
+.input-hint{font-size:10px;color:var(--mu);margin-top:3px}
+.code-wrap{background:#05060e;border:1px solid var(--bd);border-radius:8px;overflow:hidden;margin-bottom:12px}
+.code-hdr{padding:7px 12px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--bd);background:rgba(255,255,255,.015)}
+.code-lang{font-size:9.5px;font-family:var(--mono);color:var(--a);text-transform:uppercase;letter-spacing:.1em}
+.copy-btn{font-size:10px;color:var(--mu);background:none;border:none;cursor:pointer;font-family:var(--sans);padding:2px 6px;border-radius:4px;transition:all .12s}.copy-btn:hover{background:var(--s3);color:var(--tx)}
+pre{padding:13px;overflow-x:auto;font-family:var(--mono);font-size:11px;line-height:1.75;color:#9ba8c8}
+.wz-steps{display:flex;align-items:center;margin-bottom:26px}
+.wz-step{display:flex;align-items:center;flex:1}
+.wz-num{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:700;font-family:var(--mono);flex-shrink:0;transition:all .18s}
+.wz-num.done{background:var(--grn);color:#000}.wz-num.act{background:var(--a);color:#fff;box-shadow:0 0 12px rgba(108,99,255,.45)}.wz-num.idle{background:var(--s3);color:var(--mu);border:1px solid var(--bd)}
+.wz-lbl{font-size:11px;font-weight:500;margin-left:6px;color:var(--mu)}.wz-lbl.act{color:var(--tx)}
+.wz-line{flex:1;height:1px;background:var(--bd);margin:0 7px}
+.fw-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:16px}
+.fw-card{background:var(--s3);border:2px solid var(--bd);border-radius:8px;padding:12px 7px;text-align:center;cursor:pointer;transition:all .13s;position:relative}
+.fw-card:hover{border-color:var(--a);background:rgba(108,99,255,.07)}.fw-card.sel{border-color:var(--a);background:rgba(108,99,255,.12)}
+.fw-ico{font-size:19px;margin-bottom:4px}.fw-name{font-size:11px;font-weight:600;color:var(--tx)}.fw-lang{font-size:9.5px;color:var(--mu);margin-top:1px}
+.fw-pkg{position:absolute;top:6px;right:6px;font-size:8.5px;font-family:var(--mono);color:var(--mu);background:var(--s2);padding:1px 5px;border-radius:3px}
+.tabs{display:flex;border-bottom:1px solid var(--bd);margin-bottom:16px}
+.tab{padding:8px 14px;font-size:12px;font-weight:500;color:var(--mu);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .12s;background:none;border-top:none;border-left:none;border-right:none;font-family:var(--sans)}
+.tab:hover{color:var(--tx)}.tab.on{color:var(--a);border-bottom-color:var(--a)}
+.alert{padding:10px 13px;border-radius:8px;font-size:12px;display:flex;align-items:flex-start;gap:8px;margin-bottom:12px;line-height:1.5}
+.a-info{background:rgba(108,99,255,.1);border:1px solid rgba(108,99,255,.2);color:#c0bbff}
+.a-ok{background:rgba(46,204,113,.1);border:1px solid rgba(46,204,113,.2);color:var(--grn)}
+.a-err{background:rgba(255,92,92,.1);border:1px solid rgba(255,92,92,.2);color:var(--red)}
+.prog{height:3px;background:var(--s3);border-radius:2px;overflow:hidden;margin-top:5px}
+.prog-fill{height:100%;border-radius:2px;transition:width .4s ease}
+.search-wrap{position:relative;flex:1;max-width:250px}
+.search-wrap input{padding-left:30px}
+.search-ico{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:12px;pointer-events:none}
+.auth-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);padding:20px}
+.auth-card{width:400px;background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:32px 28px}
+.auth-logo{display:flex;align-items:center;gap:11px;margin-bottom:24px;justify-content:center}
+.auth-title{font-size:20px;font-weight:700;margin-bottom:4px;text-align:center}
+.auth-sub{font-size:12.5px;color:var(--mu);margin-bottom:22px;text-align:center}
+.auth-switch{text-align:center;font-size:12px;color:var(--mu);margin-top:14px}
+.auth-switch button{background:none;border:none;color:var(--a2);cursor:pointer;font-size:12px;font-family:var(--sans)}
+.tag{display:inline-block;padding:2px 6px;background:rgba(0,212,170,.1);color:var(--a2);border-radius:4px;font-size:10.5px;font-family:var(--mono);margin-right:3px}
+.chip{display:inline-block;padding:2px 6px;background:var(--s3);color:var(--mu);border-radius:4px;font-size:10.5px;margin-right:3px;margin-bottom:2px}
+.empty{text-align:center;padding:44px 20px;color:var(--mu)}
+.empty-ico{font-size:32px;margin-bottom:9px}.empty-ttl{font-size:13.5px;font-weight:600;color:var(--tx);margin-bottom:2px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:13px;margin-bottom:18px}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.1);border-top-color:var(--a);border-radius:50%;animation:spin .65s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.lc{display:flex;align-items:center;justify-content:center;padding:56px;flex-direction:column;gap:11px;color:var(--mu);font-size:12.5px}
+.divider{height:1px;background:var(--bd);margin:16px 0}
+.row-actions{display:flex;gap:4px}
+.install-tabs{display:flex;gap:6px;margin-bottom:18px;flex-wrap:wrap}
+.install-tab{padding:6px 14px;border-radius:20px;font-size:11.5px;font-weight:600;cursor:pointer;border:1px solid var(--bd);background:var(--s3);color:var(--mu);font-family:var(--sans);transition:all .13s}
+.install-tab:hover{border-color:var(--a);color:var(--tx)}.install-tab.on{background:rgba(108,99,255,.2);border-color:var(--a);color:var(--a)}
+.step-indicator{display:flex;align-items:center;gap:8px;margin-bottom:20px;padding:12px 14px;background:var(--s3);border-radius:8px;border:1px solid var(--bd)}
+.step-badge{background:var(--a);color:#fff;font-size:10px;font-weight:700;font-family:var(--mono);padding:2px 8px;border-radius:4px}
+.install-log{background:#04050b;border:1px solid var(--bd);border-radius:8px;padding:12px;font-family:var(--mono);font-size:11px;line-height:1.8;color:#9ba8c8;min-height:120px;max-height:260px;overflow-y:auto}
+.log-line{display:block;animation:appear .1s ease}
+.log-ok{color:var(--grn)}.log-err{color:var(--red)}.log-info{color:var(--a2)}.log-cmd{color:var(--a3)}
+@keyframes appear{from{opacity:0;transform:translateX(-4px)}to{opacity:1;transform:none}}
+`;
+
+// ─── SMALL COMPONENTS ─────────────────────────────────────────────────────────
+function Code({ lang, code }: { lang: string; code: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="code-wrap">
+      <div className="code-hdr">
+        <span className="code-lang">{lang}</span>
+        <button className="copy-btn" onClick={() => { void navigator.clipboard.writeText(code); setCopied(true); setTimeout(() => setCopied(false), 1800); }}>{copied ? "✓ copied" : "copy"}</button>
+      </div>
+      <pre>{code}</pre>
+    </div>
+  );
+}
+
+function Badge({ status }: { status: string }) {
+  return <span className={`badge b-${status}`}><span>●</span>{status}</span>;
+}
+
+function Spin() { return <span className="spinner" />; }
+
+function Modal({ onClose, children, lg = false, xl = false }: { onClose: () => void; children: ReactNode; lg?: boolean; xl?: boolean }) {
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className={`modal ${lg ? "modal-lg" : xl ? "modal-xl" : ""}`} onClick={e => e.stopPropagation()}>{children}</div>
+    </div>
+  );
+}
+
+// ─── AUTH ─────────────────────────────────────────────────────────────────────
+function AuthPage({ onAuth }: { onAuth: (u: SupabaseUser) => void }) {
+  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [email, setEmail] = useState("");
+  const [pass, setPass]   = useState("");
+  const [err, setErr]     = useState("");
+  const [loading, setL]   = useState(false);
+  const [done, setDone]   = useState(false);
+
+  const submit = async () => {
+    if (!email || !pass) return setErr("Email and password required.");
+    setL(true); setErr("");
+    const d = mode === "signup" ? await sb.signUp(email, pass) : await sb.signIn(email, pass);
+    if (d.error || d.error_description) setErr((d.error_description ?? (d.error as { message?: string })?.message ?? "Auth failed.") as string);
+    else if (mode === "signup") setDone(true);
+    else onAuth((d.user ?? sb._user) as SupabaseUser);
+    setL(false);
+  };
+
+  if (done) return (
+    <div className="auth-wrap">
+      <div className="auth-card" style={{ textAlign: "center" }}>
+        <div style={{ fontSize: 42, marginBottom: 14 }}>📬</div>
+        <div className="auth-title">Confirm your email</div>
+        <div className="auth-sub">Sent to <strong>{email}</strong>. Click the link then sign in.</div>
+        <button className="btn btn-ghost" style={{ width: "100%", justifyContent: "center" }} onClick={() => { setMode("signin"); setDone(false); }}>Back to Sign In</button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="auth-wrap">
+      <div className="auth-card">
+        <div className="auth-logo"><div className="logo-glyph">🔐</div><div><div className="logo-name">LicenseHub</div><div className="logo-tag">License Manager SaaS</div></div></div>
+        <div className="auth-title">{mode === "signin" ? "Welcome back" : "Create account"}</div>
+        <div className="auth-sub">{mode === "signin" ? "Sign in to manage your licenses." : "Start in minutes."}</div>
+        {err && <div className="alert a-err" style={{ marginBottom: 14 }}><span>⚠️</span>{err}</div>}
+        <div className="fg"><label>Email</label><input type="email" placeholder="you@example.com" value={email} onChange={e => setEmail(e.target.value)} onKeyDown={e => e.key === "Enter" && void submit()} /></div>
+        <div className="fg"><label>Password</label><input type="password" placeholder="••••••••" value={pass} onChange={e => setPass(e.target.value)} onKeyDown={e => e.key === "Enter" && void submit()} /></div>
+        <button className="btn btn-primary" style={{ width: "100%", justifyContent: "center", padding: "9px" }} onClick={() => void submit()} disabled={loading}>{loading ? <Spin /> : mode === "signin" ? "Sign In" : "Create Account"}</button>
+        <div className="auth-switch">{mode === "signin" ? <>No account? <button onClick={() => { setMode("signup"); setErr(""); }}>Sign up</button></> : <>Have an account? <button onClick={() => { setMode("signin"); setErr(""); }}>Sign in</button></>}</div>
+      </div>
+    </div>
+  );
+}
+
+// ─── DASHBOARD ────────────────────────────────────────────────────────────────
+function Dashboard({ licenses, logs }: { licenses: License[]; logs: ValidationLog[] }) {
+  const active  = licenses.filter(l => l.status === "active").length;
+  const expired = licenses.filter(l => l.status === "expired" || isExpired(l.expires_at)).length;
+  const trial   = licenses.filter(l => l.status === "trial").length;
+  const today   = logs.filter(l => new Date(l.created_at).toDateString() === new Date().toDateString());
+  const totalV  = today.filter(l => l.result === "valid").length;
+
+  const byFw: Record<string, number> = {};
+  logs.forEach(l => { if (l.framework) byFw[l.framework] = (byFw[l.framework] ?? 0) + 1; });
+  const fwList = Object.entries(byFw).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const recent = [...logs].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()).slice(0, 7);
+
+  return (
+    <>
+      <div className="stat-grid">
+        <div className="stat-card c1"><div className="stat-ico">🔑</div><div className="stat-lbl">Total Licenses</div><div className="stat-val">{licenses.length}</div><div className="stat-delta">All time</div></div>
+        <div className="stat-card c2"><div className="stat-ico">✅</div><div className="stat-lbl">Active</div><div className="stat-val">{active}</div><div className="stat-delta">{trial} on trial</div></div>
+        <div className="stat-card c3"><div className="stat-ico">⏳</div><div className="stat-lbl">Expired</div><div className="stat-val">{expired}</div><div className={`stat-delta ${expired > 0 ? "bad" : ""}`}>{expired > 0 ? "Action needed" : "All clear"}</div></div>
+        <div className="stat-card c4"><div className="stat-ico">📡</div><div className="stat-lbl">Validations Today</div><div className="stat-val">{today.length}</div><div className="stat-delta">{totalV} valid · {today.length - totalV} rejected</div></div>
+      </div>
+      <div className="grid2">
+        <div className="card">
+          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 13 }}>Recent Events</div>
+          {recent.length === 0 ? <div style={{ color: "var(--mu)", fontSize: 12 }}>No events yet.</div> :
+            recent.map((l, i) => (
+              <div key={l.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 0", borderBottom: i < recent.length - 1 ? "1px solid rgba(37,40,64,.5)" : "none" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span>{l.result === "valid" ? "✅" : "❌"}</span>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 500, textTransform: "capitalize" }}>{l.result.replace("_", " ")}</div>
+                    <div style={{ fontSize: 10.5, color: "var(--mu)" }}>{l.domain ?? "unknown"}{l.framework ? ` · ${l.framework}` : ""}</div>
+                  </div>
+                </div>
+                <div style={{ fontSize: 10, color: "var(--mu)" }}>{new Date(l.created_at).toLocaleTimeString()}</div>
+              </div>
+            ))
+          }
+        </div>
+        <div className="card">
+          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 13 }}>Top Frameworks</div>
+          {fwList.length === 0 ? <div style={{ color: "var(--mu)", fontSize: 12 }}>No framework data yet.</div> :
+            fwList.map(([fw, count]) => {
+              const f = FRAMEWORKS.find(x => x.id === fw);
+              return (
+                <div key={fw} style={{ marginBottom: 11 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
+                    <span>{f?.icon ?? "⚙"} {f?.name ?? fw}</span>
+                    <span style={{ color: "var(--mu)" }}>{count}</span>
+                  </div>
+                  <div className="prog"><div className="prog-fill" style={{ width: `${(count / (fwList[0][1] as number)) * 100}%`, background: "var(--a)" }} /></div>
+                </div>
+              );
+            })
+          }
+          <div className="divider" />
+          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 11 }}>Distribution</div>
+          {[
+            { l: "Active",    v: active,  c: "var(--grn)" },
+            { l: "Trial",     v: trial,   c: "var(--a3)" },
+            { l: "Expired",   v: expired, c: "var(--red)" },
+            { l: "Suspended", v: licenses.filter(x => x.status === "suspended").length, c: "var(--mu)" },
+          ].map(p => (
+            <div key={p.l} style={{ marginBottom: 9 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, marginBottom: 3 }}><span>{p.l}</span><span style={{ color: "var(--mu)" }}>{p.v}</span></div>
+              <div className="prog"><div className="prog-fill" style={{ width: licenses.length ? `${(p.v / licenses.length) * 100}%` : "0%", background: p.c }} /></div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ─── LICENSES ─────────────────────────────────────────────────────────────────
+function LicensesPage({ licenses, products, onRefresh, userId }: { licenses: License[]; products: Product[]; onRefresh: () => void; userId: string }) {
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [showNew, setShowNew] = useState(false);
+  const [wizard, setWizard]  = useState<License | null>(null);
+  const [detail, setDetail]  = useState<License | null>(null);
+
+  const filtered = licenses.filter(l => {
+    const q = search.toLowerCase();
+    const m = !q || l.key.toLowerCase().includes(q) || (l.customer_email ?? "").toLowerCase().includes(q) || (l.customer_name ?? "").toLowerCase().includes(q);
+    const s = filter === "all" || l.status === filter;
+    return m && s;
+  });
+
+  return (
+    <>
+      <div className="tbl-wrap">
+        <div className="tbl-head">
+          <span className="tbl-title">Licenses ({filtered.length})</span>
+          <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
+            <div className="search-wrap"><span className="search-ico">🔍</span><input placeholder="Key, email, name…" value={search} onChange={e => setSearch(e.target.value)} /></div>
+            <select value={filter} onChange={e => setFilter(e.target.value)} style={{ width: "auto", padding: "6px 9px" }}>
+              <option value="all">All</option><option value="active">Active</option><option value="trial">Trial</option><option value="expired">Expired</option><option value="suspended">Suspended</option>
+            </select>
+            <button className="btn btn-ghost btn-sm" onClick={onRefresh}>↻</button>
+            <button className="btn btn-primary btn-sm" onClick={() => setShowNew(true)}>+ New</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>Key</th><th>Customer</th><th>Product</th><th>Status</th><th>Activations</th><th>Expires</th><th>Actions</th></tr></thead>
+          <tbody>
+            {filtered.map(l => {
+              const prod = products.find(p => p.id === l.product_id);
+              const expd = isExpired(l.expires_at);
+              return (
+                <tr key={l.id}>
+                  <td><span className="key-mono">{l.key}</span></td>
+                  <td><div style={{ fontSize: 12 }}>{l.customer_name ?? "—"}</div><div style={{ fontSize: 10.5, color: "var(--mu)" }}>{l.customer_email ?? ""}</div></td>
+                  <td><span className="chip">{prod?.name ?? "—"}</span></td>
+                  <td><Badge status={expd && l.status === "active" ? "expired" : l.status} /></td>
+                  <td>
+                    <div style={{ fontFamily: "var(--mono)", fontSize: 11.5 }}>{l.activations}/{l.max_activations}</div>
+                    <div className="prog" style={{ width: 54 }}><div className="prog-fill" style={{ width: `${Math.min(100, (l.activations / l.max_activations) * 100)}%`, background: l.activations >= l.max_activations ? "var(--red)" : "var(--a2)" }} /></div>
+                  </td>
+                  <td style={{ fontSize: 11.5, color: expd ? "var(--red)" : "var(--mu)" }}>{l.expires_at ? fmt(l.expires_at) : "Never"}</td>
+                  <td><div className="row-actions">
+                    <button className="btn btn-ghost btn-xs" onClick={() => setDetail(l)}>View</button>
+                    <button className="btn btn-teal btn-xs" onClick={() => setWizard(l)}>⚙ Install</button>
+                  </div></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {filtered.length === 0 && <div className="empty"><div className="empty-ico">🔑</div><div className="empty-ttl">No licenses</div><div>Create your first license above.</div></div>}
+      </div>
+      {showNew && <NewLicenseModal products={products} userId={userId} onClose={() => setShowNew(false)} onCreated={() => { setShowNew(false); onRefresh(); }} />}
+      {wizard  && <AutoInstallWizard license={wizard} onClose={() => setWizard(null)} />}
+      {detail  && <LicenseDetail license={detail} products={products} onClose={() => setDetail(null)} onRefresh={() => { setDetail(null); onRefresh(); }} />}
+    </>
+  );
+}
+
+interface NewLicenseModalProps { products: Product[]; userId: string; onClose: () => void; onCreated: () => void; }
+function NewLicenseModal({ products, userId, onClose, onCreated }: NewLicenseModalProps) {
+  const [f, setF] = useState({ product_id: products[0]?.id ?? "", customer_name: "", customer_email: "", allowed_domains: "", allowed_ips: "", max_activations: "1", expires_at: "", status: "active", notes: "" });
+  const [loading, setL] = useState(false);
+  const [err, setErr]   = useState("");
+
+  const submit = async () => {
+    setL(true); setErr("");
+    try {
+      await sb.insert("lh_licenses", {
+        key: genKey(), owner_id: userId,
+        product_id: f.product_id || null,
+        customer_name: f.customer_name || null,
+        customer_email: f.customer_email || null,
+        allowed_domains: f.allowed_domains ? f.allowed_domains.split(",").map(s => s.trim()).filter(Boolean) : null,
+        allowed_ips: f.allowed_ips ? f.allowed_ips.split(",").map(s => s.trim()).filter(Boolean) : null,
+        max_activations: Number(f.max_activations) || 1,
+        expires_at: f.expires_at || null, status: f.status, notes: f.notes || null,
+      });
+      onCreated();
+    } catch (e: unknown) { setErr(e instanceof Error ? e.message : "Unknown error"); }
+    setL(false);
+  };
+
+  return (
+    <Modal onClose={onClose} lg>
+      <div className="modal-title">Generate New License</div>
+      <div className="modal-sub">Stored in Supabase — gdmknaditlpfjcplsygc.</div>
+      {err && <div className="alert a-err">{err}</div>}
+      <div className="fr">
+        <div className="fg"><label>Product</label><select value={f.product_id} onChange={e => setF({ ...f, product_id: e.target.value })}><option value="">None</option>{products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
+        <div className="fg"><label>Status</label><select value={f.status} onChange={e => setF({ ...f, status: e.target.value })}><option value="active">Active</option><option value="trial">Trial</option><option value="suspended">Suspended</option></select></div>
+      </div>
+      <div className="fr">
+        <div className="fg"><label>Customer Name</label><input placeholder="Acme Corp" value={f.customer_name} onChange={e => setF({ ...f, customer_name: e.target.value })} /></div>
+        <div className="fg"><label>Customer Email</label><input placeholder="billing@acme.com" value={f.customer_email} onChange={e => setF({ ...f, customer_email: e.target.value })} /></div>
+      </div>
+      <div className="fg"><label>Allowed Domains (comma-separated)</label><input placeholder="acme.com, app.acme.com" value={f.allowed_domains} onChange={e => setF({ ...f, allowed_domains: e.target.value })} /><div className="input-hint">Blank = any domain</div></div>
+      <div className="fg"><label>Allowed IPs</label><input placeholder="1.2.3.4" value={f.allowed_ips} onChange={e => setF({ ...f, allowed_ips: e.target.value })} /></div>
+      <div className="fr">
+        <div className="fg"><label>Max Activations</label><input type="number" min={1} value={f.max_activations} onChange={e => setF({ ...f, max_activations: e.target.value })} /></div>
+        <div className="fg"><label>Expiry Date</label><input type="date" value={f.expires_at} onChange={e => setF({ ...f, expires_at: e.target.value })} /></div>
+      </div>
+      <div className="fg"><label>Notes</label><textarea placeholder="Internal notes…" value={f.notes} onChange={e => setF({ ...f, notes: e.target.value })} /></div>
+      <div className="modal-foot">
+        <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        <button className="btn btn-primary" onClick={() => void submit()} disabled={loading}>{loading ? <Spin /> : "Generate License"}</button>
+      </div>
+    </Modal>
+  );
+}
+
+interface LicenseDetailProps { license: License; products: Product[]; onClose: () => void; onRefresh: () => void; }
+function LicenseDetail({ license: l, products, onClose, onRefresh }: LicenseDetailProps) {
+  const [loading, setL] = useState(false);
+  const prod = products.find(p => p.id === l.product_id);
+  const setStatus = async (s: string) => { setL(true); await sb.update("lh_licenses", { status: s }, { id: l.id }); setL(false); onRefresh(); };
+
+  return (
+    <Modal onClose={onClose} lg>
+      <div className="modal-title">License Detail</div>
+      <div className="modal-sub"><span className="key-mono">{l.key}</span></div>
+      <div className="grid2" style={{ marginBottom: 0 }}>
+        <div>
+          <div className="fg"><label>Customer</label><div>{l.customer_name ?? "—"}<br /><span style={{ color: "var(--mu)", fontSize: 11.5 }}>{l.customer_email ?? ""}</span></div></div>
+          <div className="fg"><label>Product</label><div>{prod?.name ?? "—"}</div></div>
+          <div className="fg"><label>Status</label><Badge status={l.status} /></div>
+          <div className="fg"><label>Expires</label><div style={{ color: isExpired(l.expires_at) ? "var(--red)" : "var(--tx)" }}>{l.expires_at ? fmt(l.expires_at) : "Never"}</div></div>
+        </div>
+        <div>
+          <div className="fg"><label>Activations</label><div style={{ fontFamily: "var(--mono)" }}>{l.activations} / {l.max_activations}</div></div>
+          <div className="fg"><label>Allowed Domains</label><div>{l.allowed_domains?.length ? l.allowed_domains.map(d => <span key={d} className="tag">{d}</span>) : <span style={{ color: "var(--mu)", fontSize: 12 }}>Any</span>}</div></div>
+          <div className="fg"><label>Allowed IPs</label><div>{l.allowed_ips?.length ? l.allowed_ips.map(ip => <span key={ip} className="chip">{ip}</span>) : <span style={{ color: "var(--mu)", fontSize: 12 }}>Any</span>}</div></div>
+          <div className="fg"><label>Created</label><div style={{ fontSize: 12, color: "var(--mu)" }}>{fmt(l.created_at)}</div></div>
+        </div>
+      </div>
+      {l.notes && <div className="fg"><label>Notes</label><div style={{ fontSize: 12, color: "var(--mu)" }}>{l.notes}</div></div>}
+      <div className="modal-foot" style={{ justifyContent: "space-between" }}>
+        <div style={{ display: "flex", gap: 5 }}>
+          {l.status !== "active"    && <button className="btn btn-success btn-sm" onClick={() => void setStatus("active")}    disabled={loading}>Activate</button>}
+          {l.status !== "suspended" && <button className="btn btn-danger  btn-sm" onClick={() => void setStatus("suspended")} disabled={loading}>Suspend</button>}
+        </div>
+        <button className="btn btn-ghost" onClick={onClose}>Close</button>
+      </div>
+    </Modal>
+  );
+}
+
+// ─── AUTO-INSTALL WIZARD ──────────────────────────────────────────────────────
+function AutoInstallWizard({ license, onClose }: { license: License; onClose: () => void }) {
+  const [step, setStep]       = useState(0);
+  const [fw, setFw]           = useState<Framework | null>(null);
+  const [tab, setTab]         = useState("bash");
+  const [simRunning, setSim]  = useState(false);
+  const [simLogs, setSimLogs] = useState<SimLogLine[]>([]);
+  const [simDone, setSimDone] = useState(false);
+  const logRef = useRef<HTMLDivElement>(null);
+  const steps  = ["Select Framework", "Auto-Install Script", "Done"];
+
+  const runSimulation = async (framework: Framework) => {
+    setSim(true); setSimDone(false); setSimLogs([]);
+    const lines: SimLogLine[] = [
+      { t: 0,   cls: "log-info", text: `🔑 LicenseHub — ${framework.name} Auto-Installer` },
+      { t: 200, cls: "log-info", text: "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" },
+      { t: 400, cls: "log-cmd",  text: "$ Checking project structure…" },
+      { t: 800, cls: "",         text: "  ✓ Project root detected" },
+      { t: 1000,cls: "log-cmd",  text: "$ Creating config files…" },
+      { t: 1400,cls: "",         text: "  ✓ Config file created" },
+      { t: 1700,cls: "log-cmd",  text: "$ Installing dependencies…" },
+      { t: 2200,cls: "",         text: "  ✓ Dependencies resolved" },
+      { t: 2500,cls: "log-cmd",  text: "$ Creating middleware / validator…" },
+      { t: 2900,cls: "",         text: "  ✓ Middleware created" },
+      { t: 3100,cls: "log-cmd",  text: "$ Writing .env variables…" },
+      { t: 3400,cls: "",         text: "  ✓ SUPABASE_URL=https://gdmknaditlpfjcplsygc.supabase.co" },
+      { t: 3600,cls: "",         text: `  ✓ LICENSE_KEY=${license.key}` },
+      { t: 3900,cls: "log-cmd",  text: "$ Validating configuration…" },
+      { t: 4400,cls: "log-ok",   text: `  ✓ License valid — status: ${license.status}` },
+      { t: 4800,cls: "log-ok",   text: "✅ Installation complete!" },
+    ];
+    for (const line of lines) {
+      await new Promise<void>(r => setTimeout(r, 200));
+      setSimLogs(prev => [...prev, line]);
+      if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+    setSim(false); setSimDone(true);
+  };
+
+  const fwId     = fw?.id as FrameworkId | undefined;
+  const installer = fwId ? AUTO_INSTALL[fwId] : null;
+  const bashScript = installer ? installer.bash(license.key) : "";
+  const verifyCmd  = installer ? installer.verify(license.key) : "";
+
+  return (
+    <Modal onClose={onClose} xl>
+      <div className="modal-title">⚙ Auto-Install Wizard</div>
+      <div className="modal-sub">License: <span className="key-mono">{license.key}</span>{license.customer_name ? ` · ${license.customer_name}` : ""}</div>
+      <div className="wz-steps">
+        {steps.map((s, i) => (
+          <div key={s} className="wz-step">
+            <div className={`wz-num ${i < step ? "done" : i === step ? "act" : "idle"}`}>{i < step ? "✓" : i + 1}</div>
+            <span className={`wz-lbl ${i === step ? "act" : ""}`}>{s}</span>
+            {i < steps.length - 1 && <div className="wz-line" />}
+          </div>
+        ))}
+      </div>
+
+      {step === 0 && (
+        <>
+          <div style={{ fontSize: 12, color: "var(--mu)", marginBottom: 14 }}>Choose your framework. A complete auto-install script will be generated with your license key pre-filled.</div>
+          <div className="fw-grid">
+            {FRAMEWORKS.map(f => (
+              <div key={f.id} className={`fw-card ${fw?.id === f.id ? "sel" : ""}`} onClick={() => setFw(f)}>
+                <div className="fw-pkg">{f.pkg}</div>
+                <div className="fw-ico">{f.icon}</div>
+                <div className="fw-name">{f.name}</div>
+                <div className="fw-lang">{f.lang}</div>
+              </div>
+            ))}
+          </div>
+          {fw && <div className="alert a-info"><span>{fw.icon}</span><div>Selected: <strong>{fw.name}</strong> ({fw.lang}) · pkg: <code style={{ fontFamily: "var(--mono)", fontSize: 11 }}>{fw.pkg}</code></div></div>}
+          <div className="modal-foot">
+            <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" disabled={!fw} onClick={() => { setStep(1); setTab("bash"); }}>Generate Script →</button>
+          </div>
+        </>
+      )}
+
+      {step === 1 && fw && (
+        <>
+          <div className="step-indicator"><span className="step-badge">{fw.icon} {fw.name}</span><span style={{ fontSize: 12, color: "var(--mu)" }}>Run the script below in your project root.</span></div>
+          <div className="install-tabs">
+            <button className={`install-tab ${tab === "bash" ? "on" : ""}`} onClick={() => setTab("bash")}>📄 Install Script</button>
+            <button className={`install-tab ${tab === "simulate" ? "on" : ""}`} onClick={() => { setTab("simulate"); if (!simDone && !simRunning) void runSimulation(fw); }}>▶ Simulate</button>
+            <button className={`install-tab ${tab === "verify" ? "on" : ""}`} onClick={() => setTab("verify")}>✓ Verify</button>
+          </div>
+          {tab === "bash"     && <><div className="alert a-info"><span>💡</span><div style={{ fontSize: 11.5 }}>Save as <code style={{ fontFamily: "var(--mono)" }}>install-license.sh</code>, run <code style={{ fontFamily: "var(--mono)" }}>chmod +x install-license.sh && ./install-license.sh</code></div></div><Code lang="bash" code={bashScript} /></>}
+          {tab === "simulate" && (
+            <>
+              <div className="alert a-info" style={{ marginBottom: 10 }}><span>▶</span><span style={{ fontSize: 11.5 }}>Simulated run for <strong>{fw.name}</strong></span></div>
+              <div className="install-log" ref={logRef}>
+                {simLogs.map((l, i) => <span key={i} className={`log-line ${l.cls}`}>{l.text}{"\n"}</span>)}
+                {simRunning && <span className="log-line"><Spin /> running…{"\n"}</span>}
+              </div>
+              {simDone && <div className="alert a-ok" style={{ marginTop: 10 }}><span>✅</span><span>Simulation complete! Run the Install Script tab in your actual project.</span></div>}
+              {!simRunning && !simDone && <button className="btn btn-primary btn-sm" style={{ marginTop: 8 }} onClick={() => void runSimulation(fw)}>▶ Run Again</button>}
+            </>
+          )}
+          {tab === "verify"   && <><div className="alert a-info"><span>✓</span><span style={{ fontSize: 11.5 }}>Run after installation to confirm your license is active:</span></div><Code lang="bash" code={verifyCmd || "# No verify command"} /></>}
+          <div className="modal-foot">
+            <button className="btn btn-ghost" onClick={() => setStep(0)}>← Back</button>
+            <button className="btn btn-primary" onClick={() => setStep(2)}>Done →</button>
+          </div>
+        </>
+      )}
+
+      {step === 2 && (
+        <div style={{ textAlign: "center", padding: "14px 0" }}>
+          <div style={{ fontSize: 46, marginBottom: 12 }}>🎉</div>
+          <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 5 }}>Installation Ready!</div>
+          <div style={{ fontSize: 12.5, color: "var(--mu)", marginBottom: 18 }}>Run the generated script in your <strong>{fw?.name}</strong> project root.</div>
+          <div className="alert a-ok" style={{ textAlign: "left" }}>
+            <span>✓</span>
+            <div style={{ fontSize: 12 }}>
+              <strong>Key:</strong> <span className="key-mono">{license.key}</span><br />
+              <strong>Supabase:</strong> gdmknaditlpfjcplsygc.supabase.co<br />
+              <strong>Framework:</strong> {fw?.icon} {fw?.name}
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+            <button className="btn btn-ghost" onClick={() => setStep(1)}>← Back</button>
+            <button className="btn btn-primary" onClick={onClose}>Close</button>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// ─── VALIDATE PAGE ────────────────────────────────────────────────────────────
+function ValidatePage() {
+  const [key, setKey]       = useState("");
+  const [domain, setDomain] = useState("");
+  const [ip, setIp]         = useState("");
+  const [fw, setFw]         = useState("");
+  const [result, setResult] = useState<ValidationResult | null>(null);
+  const [loading, setL]     = useState(false);
+
+  const validate = async () => {
+    setL(true); setResult(null);
+    const rows = await sb.select<License>("lh_licenses", `key=eq.${encodeURIComponent(key.trim().toUpperCase())}`);
+    const lic  = rows[0] ?? null;
+    let res: string = "invalid";
+    let reason: string | null = "License key not found.";
+    if (lic) {
+      if (lic.status === "suspended")                                                                                                                             { res = "suspended";      reason = "License suspended."; }
+      else if (lic.status === "expired" || isExpired(lic.expires_at))                                                                                           { res = "expired";        reason = "License expired."; }
+      else if (lic.max_activations > 0 && lic.activations >= lic.max_activations)                                                                               { res = "quota_exceeded"; reason = "Quota exceeded."; }
+      else if (domain && lic.allowed_domains?.length && !lic.allowed_domains.includes(domain.replace(/^https?:\/\//, "").split("/")[0])) { res = "domain_mismatch"; reason = `Domain not allowed. Permitted: ${lic.allowed_domains.join(", ")}`; }
+      else if (ip && lic.allowed_ips?.length && !lic.allowed_ips.includes(ip))                                                                                  { res = "invalid";        reason = `IP ${ip} not in allowed list.`; }
+      else { res = "valid"; reason = null; }
+    }
+    await sb.insert("lh_validation_logs", { license_id: lic?.id ?? null, license_key: key.trim().toUpperCase(), domain: domain || null, ip_address: ip || null, framework: fw || null, result: res });
+    setResult({ valid: res === "valid", result: res, reason, license: lic });
+    setL(false);
+  };
+
+  return (
+    <div style={{ maxWidth: 540 }}>
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ fontWeight: 600, fontSize: 13.5, marginBottom: 3 }}>Test License Validation</div>
+        <div style={{ fontSize: 12, color: "var(--mu)", marginBottom: 16 }}>Simulates a real SDK call — result logged to <code style={{ fontFamily: "var(--mono)", fontSize: 11 }}>lh_validation_logs</code>.</div>
+        <div className="fg"><label>License Key *</label><input placeholder="XXXXX-XXXXX-XXXXX-XXXXX" value={key} onChange={e => setKey(e.target.value)} style={{ fontFamily: "var(--mono)", letterSpacing: ".05em" }} /></div>
+        <div className="fr">
+          <div className="fg"><label>Domain</label><input placeholder="yourdomain.com" value={domain} onChange={e => setDomain(e.target.value)} /></div>
+          <div className="fg"><label>IP Address</label><input placeholder="1.2.3.4" value={ip} onChange={e => setIp(e.target.value)} /></div>
+        </div>
+        <div className="fg"><label>Framework</label><select value={fw} onChange={e => setFw(e.target.value)}><option value="">Not specified</option>{FRAMEWORKS.map(f => <option key={f.id} value={f.id}>{f.icon} {f.name}</option>)}</select></div>
+        <button className="btn btn-primary" onClick={() => void validate()} disabled={!key.trim() || loading} style={{ width: "100%", justifyContent: "center", padding: "9px" }}>{loading ? <><Spin /> Validating…</> : "Validate License"}</button>
+      </div>
+      {result && (
+        <div className={`alert ${result.valid ? "a-ok" : "a-err"}`}>
+          <span>{result.valid ? "✅" : "❌"}</span>
+          <div>
+            <strong>{result.valid ? "Valid License" : `Rejected: ${result.result.replace("_", " ")}`}</strong>
+            {!result.valid && <><br /><span style={{ fontSize: 11.5 }}>{result.reason}</span></>}
+            {result.valid && result.license && <div style={{ fontSize: 11.5, marginTop: 3 }}>Customer: {result.license.customer_name ?? "—"} · Expires: {result.license.expires_at ? fmt(result.license.expires_at) : "Never"} · Activations: {result.license.activations}/{result.license.max_activations}</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── ANALYTICS ────────────────────────────────────────────────────────────────
+function AnalyticsPage({ logs }: { logs: ValidationLog[] }) {
+  const byDay: Record<string, DayCount> = {};
+  logs.forEach(l => {
+    const d = new Date(l.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    if (!byDay[d]) byDay[d] = { v: 0, i: 0 };
+    if (l.result === "valid") byDay[d]!.v++; else byDay[d]!.i++;
+  });
+  const days   = Object.entries(byDay).slice(-7).reverse();
+  const byRes: Record<string, number> = {};
+  logs.forEach(l => { byRes[l.result] = (byRes[l.result] ?? 0) + 1; });
+  const totalV = logs.filter(l => l.result === "valid").length;
+  const totalI = logs.length - totalV;
+  const rate   = logs.length ? Math.round((totalV / logs.length) * 100) : 0;
+
+  return (
+    <>
+      <div className="stat-grid" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
+        <div className="stat-card c1"><div className="stat-ico">📊</div><div className="stat-lbl">Total Validations</div><div className="stat-val">{logs.length}</div></div>
+        <div className="stat-card c2"><div className="stat-ico">✅</div><div className="stat-lbl">Success Rate</div><div className="stat-val">{rate}%</div><div className="stat-delta">{totalV} valid · {totalI} rejected</div></div>
+        <div className="stat-card c3"><div className="stat-ico">⚠️</div><div className="stat-lbl">Rejection Types</div><div className="stat-val">{Object.keys(byRes).filter(r => r !== "valid").length}</div></div>
+      </div>
+      <div className="grid2">
+        <div className="card">
+          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 13 }}>Last 7 Days</div>
+          {days.length === 0 ? <div style={{ color: "var(--mu)", fontSize: 12 }}>No data yet.</div> : days.map(([day, c]) => (
+            <div key={day} style={{ marginBottom: 11 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, marginBottom: 3 }}>
+                <span>{day}</span>
+                <span style={{ color: "var(--mu)" }}>{c.v + c.i} · <span style={{ color: "var(--grn)" }}>{c.v}✓</span> · <span style={{ color: "var(--red)" }}>{c.i}✗</span></span>
+              </div>
+              <div style={{ display: "flex", gap: 2 }}>
+                {c.v > 0 && <div className="prog" style={{ flex: c.v }}><div className="prog-fill" style={{ width: "100%", background: "var(--grn)" }} /></div>}
+                {c.i > 0 && <div className="prog" style={{ flex: c.i }}><div className="prog-fill" style={{ width: "100%", background: "var(--red)" }} /></div>}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="card">
+          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 13 }}>Rejections</div>
+          {Object.entries(byRes).filter(([r]) => r !== "valid").length === 0
+            ? <div style={{ color: "var(--mu)", fontSize: 12 }}>No rejections.</div>
+            : Object.entries(byRes).filter(([r]) => r !== "valid").sort((a, b) => b[1] - a[1]).map(([r, c]) => (
+              <div key={r} style={{ marginBottom: 11 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, marginBottom: 3 }}><span style={{ textTransform: "capitalize" }}>{r.replace("_", " ")}</span><span style={{ color: "var(--mu)" }}>{c}</span></div>
+                <div className="prog"><div className="prog-fill" style={{ width: totalI ? `${(c / totalI) * 100}%` : "0%", background: "var(--red)" }} /></div>
+              </div>
+            ))
+          }
+          <div className="divider" />
+          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 10 }}>Recent Logs</div>
+          <div style={{ maxHeight: 190, overflowY: "auto" }}>
+            {[...logs].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()).slice(0, 30).map(l => (
+              <div key={l.id} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid rgba(37,40,64,.4)", fontSize: 10.5 }}>
+                <span style={{ fontFamily: "var(--mono)", color: "var(--mu)" }}>{l.license_key.substring(0, 14)}…</span>
+                <span style={{ color: l.result === "valid" ? "var(--grn)" : "var(--red)", textTransform: "capitalize" }}>{l.result}</span>
+                <span style={{ color: "var(--mu)" }}>{new Date(l.created_at).toLocaleTimeString()}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ─── PRODUCTS ─────────────────────────────────────────────────────────────────
+function ProductsPage({ products, onRefresh, userId }: { products: Product[]; onRefresh: () => void; userId: string }) {
+  const [showNew, setShowNew] = useState(false);
+  const [name, setName] = useState("");
+  const [desc, setDesc] = useState("");
+  const [loading, setL] = useState(false);
+
+  const create = async () => {
+    if (!name.trim()) return; setL(true);
+    await sb.insert("lh_products", { name: name.trim(), description: desc.trim() || null, owner_id: userId });
+    setL(false); setShowNew(false); setName(""); setDesc(""); onRefresh();
+  };
+  const del = async (id: string) => { if (!confirm("Delete product?")) return; await sb.del("lh_products", { id }); onRefresh(); };
+
+  return (
+    <>
+      <div className="tbl-wrap">
+        <div className="tbl-head"><span className="tbl-title">Products ({products.length})</span><button className="btn btn-primary btn-sm" onClick={() => setShowNew(true)}>+ New</button></div>
+        <table>
+          <thead><tr><th>Name</th><th>Description</th><th>Created</th><th></th></tr></thead>
+          <tbody>{products.map(p => <tr key={p.id}><td style={{ fontWeight: 600 }}>{p.name}</td><td style={{ color: "var(--mu)" }}>{p.description ?? "—"}</td><td style={{ fontSize: 11.5, color: "var(--mu)" }}>{fmt(p.created_at)}</td><td><button className="btn btn-danger btn-xs" onClick={() => void del(p.id)}>Delete</button></td></tr>)}</tbody>
+        </table>
+        {products.length === 0 && <div className="empty"><div className="empty-ico">📦</div><div className="empty-ttl">No products</div><div>Create plans like Starter, Pro, Enterprise.</div></div>}
+      </div>
+      {showNew && (
+        <Modal onClose={() => setShowNew(false)}>
+          <div className="modal-title">New Product</div>
+          <div className="fg"><label>Name</label><input placeholder="Pro Suite" value={name} onChange={e => setName(e.target.value)} /></div>
+          <div className="fg"><label>Description</label><input placeholder="Up to 5 domains" value={desc} onChange={e => setDesc(e.target.value)} /></div>
+          <div className="modal-foot"><button className="btn btn-ghost" onClick={() => setShowNew(false)}>Cancel</button><button className="btn btn-primary" onClick={() => void create()} disabled={loading || !name.trim()}>{loading ? <Spin /> : "Create"}</button></div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+// ─── SDK WIZARD LANDING ───────────────────────────────────────────────────────
+function WizardPage() {
+  const [sel, setSel] = useState<Framework | null>(null);
+  const [tab, setTab] = useState("bash");
+  const fwId     = sel?.id as FrameworkId | undefined;
+  const installer = fwId ? AUTO_INSTALL[fwId] : null;
+
+  return (
+    <>
+      <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 3 }}>Framework Auto-Install Scripts</div>
+      <div style={{ fontSize: 12, color: "var(--mu)", marginBottom: 16 }}>Pick a framework to generate a complete auto-install script.</div>
+      <div className="fw-grid">
+        {FRAMEWORKS.map(f => (
+          <div key={f.id} className={`fw-card ${sel?.id === f.id ? "sel" : ""}`} onClick={() => { setSel(f); setTab("bash"); }}>
+            <div className="fw-pkg">{f.pkg}</div>
+            <div className="fw-ico">{f.icon}</div>
+            <div className="fw-name">{f.name}</div>
+            <div className="fw-lang">{f.lang}</div>
+          </div>
+        ))}
+      </div>
+      {sel && installer ? (
+        <div className="card">
+          <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+            <span style={{ fontSize: 20 }}>{sel.icon}</span>
+            <div><div style={{ fontWeight: 600, fontSize: 13.5 }}>{sel.name} · Auto-Install Script</div><div style={{ fontSize: 11.5, color: "var(--mu)" }}>Replace <code style={{ fontFamily: "var(--mono)", fontSize: 11 }}>YOUR_LICENSE_KEY</code> with a real key from the Licenses page.</div></div>
+          </div>
+          <div className="tabs">
+            <button className={`tab ${tab === "bash" ? "on" : ""}`} onClick={() => setTab("bash")}>Install Script</button>
+            <button className={`tab ${tab === "verify" ? "on" : ""}`} onClick={() => setTab("verify")}>Verify</button>
+          </div>
+          {tab === "bash"   && <Code lang="bash" code={installer.bash("YOUR_LICENSE_KEY")} />}
+          {tab === "verify" && <><div className="alert a-info"><span>✓</span><span>Run after install to confirm your license is active.</span></div><Code lang="bash" code={installer.verify("YOUR_LICENSE_KEY")} /></>}
+        </div>
+      ) : <div className="empty"><div className="empty-ico">⚙</div><div className="empty-ttl">Select a framework above</div></div>}
+    </>
+  );
+}
+
+// ─── API DOCS ─────────────────────────────────────────────────────────────────
+function ApiDocsPage() {
+  return (
+    <div style={{ maxWidth: 720 }}>
+      <div className="alert a-info" style={{ marginBottom: 16 }}>
+        <span>📡</span>
+        <div><strong>Supabase REST API</strong> — Base: <code style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--a2)" }}>https://gdmknaditlpfjcplsygc.supabase.co</code></div>
+      </div>
+      <Code lang="typescript" code={`const SB  = "https://gdmknaditlpfjcplsygc.supabase.co";
+const KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...";
+const LIC = "YOUR_LICENSE_KEY";
+const H   = { apikey: KEY, Authorization: \`Bearer \${KEY}\`, "Content-Type": "application/json" };
+
+async function validate(domain: string, framework: string) {
+  const [lic] = await fetch(\`\${SB}/rest/v1/lh_licenses?key=eq.\${LIC}\`, { headers: H }).then(r => r.json());
+  const result = !lic ? "invalid"
+    : lic.status === "suspended" ? "suspended"
+    : lic.status === "expired" || (lic.expires_at && new Date(lic.expires_at) < new Date()) ? "expired"
+    : lic.max_activations > 0 && lic.activations >= lic.max_activations ? "quota_exceeded"
+    : lic.allowed_domains?.length && !lic.allowed_domains.includes(domain) ? "domain_mismatch"
+    : "valid";
+  await fetch(\`\${SB}/rest/v1/lh_validation_logs\`, {
+    method: "POST", headers: H,
+    body: JSON.stringify({ license_id: lic?.id, license_key: LIC, domain, framework, result }),
+  });
+  return { valid: result === "valid", result };
+}`} />
+    </div>
+  );
+}
+
+// ─── DB SETUP ─────────────────────────────────────────────────────────────────
+function DatabasePage() {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div style={{ maxWidth: 760 }}>
+      <div className="alert a-info" style={{ marginBottom: 16 }}>
+        <span>🗄️</span>
+        <div>Run once in your <a href="https://supabase.com/dashboard/project/gdmknaditlpfjcplsygc/sql/new" target="_blank" rel="noreferrer">Supabase SQL Editor</a>.</div>
+      </div>
+      <div className="code-wrap">
+        <div className="code-hdr"><span className="code-lang">SQL — gdmknaditlpfjcplsygc</span><button className="copy-btn" onClick={() => { void navigator.clipboard.writeText(SQL_SCHEMA); setCopied(true); setTimeout(() => setCopied(false), 2000); }}>{copied ? "✓ Copied!" : "Copy All"}</button></div>
+        <pre style={{ maxHeight: 440, overflowY: "auto" }}>{SQL_SCHEMA}</pre>
+      </div>
+    </div>
+  );
+}
+
+// ─── ROOT ─────────────────────────────────────────────────────────────────────
+type PageId = "dashboard" | "licenses" | "products" | "validate" | "analytics" | "wizard" | "api" | "database";
+
+const PAGE_TITLES: Record<PageId, string> = {
+  dashboard: "Dashboard", licenses: "Licenses", products: "Products",
+  validate: "Validate License", analytics: "Analytics", wizard: "SDK Auto-Install",
+  api: "API Docs", database: "DB Schema",
+};
+
+export default function App() {
+  const [user, setUser]       = useState<SupabaseUser | null>(null);
+  const [restoring, setRest]  = useState(true);
+  const [page, setPage]       = useState<PageId>("dashboard");
+  const [licenses, setLic]    = useState<License[]>([]);
+  const [products, setProd]   = useState<Product[]>([]);
+  const [logs, setLogs]       = useState<ValidationLog[]>([]);
+  const [loading, setLoad]    = useState(false);
+
+  // Restore session on mount
+  useEffect(() => {
+    const ok = sb.restore();
+    if (ok && sb._user) setUser(sb._user);
+    setRest(false);
+  }, []);
+
+  // Auto-refresh token every 50 min
+  useEffect(() => {
+    if (!user) return;
+    const id = setInterval(() => { void sb.refresh(); }, 50 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [user]);
+
+  const load = useCallback(async () => {
+    if (!sb._token) return;
+    setLoad(true);
+    const [l, p, lg] = await Promise.all([
+      sb.select<License>("lh_licenses", "select=*&order=created_at.desc"),
+      sb.select<Product>("lh_products", "select=*&order=created_at.desc"),
+      sb.select<ValidationLog>("lh_validation_logs", "select=*&order=created_at.desc&limit=300"),
+    ]);
+    setLic(l); setProd(p); setLogs(lg);
+    setLoad(false);
+  }, []);
+
+  useEffect(() => { if (user) void load(); }, [user, load]);
+
+  const logout = async () => { await sb.signOut(); setUser(null); setLic([]); setProd([]); setLogs([]); };
+
+  if (restoring) return (
+    <>
+      <style>{css}</style>
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg)", color: "var(--mu)", fontFamily: "var(--sans)", flexDirection: "column", gap: 12 }}>
+        <div className="logo-glyph" style={{ margin: "0 auto" }}>🔐</div>
+        <div style={{ fontSize: 12, marginTop: 8 }}>Restoring session…</div>
+      </div>
+    </>
+  );
+
+  if (!user) return <><style>{css}</style><AuthPage onAuth={u => setUser(u)} /></>;
+
+  const nav: { g: string; items: { id: PageId; l: string; i: string; count?: number }[] }[] = [
+    { g: "Main",  items: [{ id: "dashboard", l: "Dashboard", i: "◈" }, { id: "licenses", l: "Licenses", i: "🔑", count: licenses.filter(x => x.status === "active").length }, { id: "products", l: "Products", i: "📦" }] },
+    { g: "Tools", items: [{ id: "validate", l: "Validate", i: "✓" }, { id: "analytics", l: "Analytics", i: "📊" }, { id: "wizard", l: "SDK Wizard", i: "⚙" }] },
+    { g: "Setup", items: [{ id: "api", l: "API Docs", i: "📡" }, { id: "database", l: "DB Schema", i: "🗄️" }] },
+  ];
+
+  const renderPage = () => {
+    if (loading) return <div className="lc"><Spin /><span>Loading from Supabase…</span></div>;
+    switch (page) {
+      case "dashboard":  return <Dashboard licenses={licenses} logs={logs} />;
+      case "licenses":   return <LicensesPage licenses={licenses} products={products} onRefresh={load} userId={user.id} />;
+      case "products":   return <ProductsPage products={products} onRefresh={load} userId={user.id} />;
+      case "validate":   return <ValidatePage />;
+      case "analytics":  return <AnalyticsPage logs={logs} />;
+      case "wizard":     return <WizardPage />;
+      case "api":        return <ApiDocsPage />;
+      case "database":   return <DatabasePage />;
+    }
+  };
+
+  return (
+    <>
+      <style>{css}</style>
+      <div className="shell">
+        <div className="sidebar">
+          <div className="logo"><div className="logo-glyph">🔐</div><div><div className="logo-name">LicenseHub</div><div className="logo-tag">SaaS Manager</div></div></div>
+          <nav className="nav">
+            {nav.map(g => (
+              <div key={g.g} className="nav-group">
+                <div className="nav-lbl">{g.g}</div>
+                {g.items.map(item => (
+                  <button key={item.id} className={`nav-btn ${page === item.id ? "on" : ""}`} onClick={() => setPage(item.id)}>
+                    <span className="ico">{item.i}</span>{item.l}
+                    {(item.count ?? 0) > 0 && <span className="nb-count">{item.count}</span>}
+                  </button>
+                ))}
+              </div>
+            ))}
+          </nav>
+          <div className="sb-foot">
+            <div className="sb-user">{user.email}</div>
+            <div><span className="dot dot-on" />gdmknaditlpfjcplsygc</div>
+            <button className="btn btn-ghost btn-xs" style={{ marginTop: 5 }} onClick={() => void logout()}>Sign Out</button>
+          </div>
+        </div>
+        <div className="main">
+          <div className="topbar">
+            <span className="topbar-title">{PAGE_TITLES[page]}</span>
+            <div className="topbar-right">
+              <button className="btn btn-ghost btn-sm" onClick={() => void load()} disabled={loading}>↻ Refresh</button>
+              <button className="btn btn-primary btn-sm" onClick={() => setPage("licenses")}>+ New License</button>
+            </div>
+          </div>
+          <div className="content">{renderPage()}</div>
+        </div>
+      </div>
+    </>
+  );
+}
