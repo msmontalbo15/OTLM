@@ -2,20 +2,15 @@
   "name": "license-manager",
   "private": true,
   "version": "0.0.0",
+    "homepage": "https://msmontalbo15.github.io",
   "type": "module",
   "scripts": {
-    
-      "start": "react-scripts start",
-  "build": "react-scripts build",
-  "test": "react-scripts test",
-  "eject": "react-scripts eject",
+  "dev": "vite",
+  "build": "tsc && vite build",
+  "lint": "eslint .",
+  "preview": "vite preview",
   "predeploy": "npm run build",
-  "deploy": "gh-pages -d build",
-    "dev": "vite",
-    "lint": "eslint .",
-    "preview": "vite preview",
-    "homepage": "https://msmontalbo15.github.io/OTLM"
-
+  "deploy": "gh-pages -d dist"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.98.0",
